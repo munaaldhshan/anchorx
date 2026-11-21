@@ -18,7 +18,8 @@
 //            latencyMs, usage, fallbackUsed, reason, degraded }
 import { z } from 'zod';
 import logger from '../utils/logger.js';
-import { resolveChain, runtimeConfig } from './config.js';
+import { resolveChain, runtimeConfig, TIERS } from './config.js';
+import { reserveUserCall, recordUserTokens } from './userQuota.js';
 import { getProvider } from './providers/index.js';
 import { limiterFor } from './rateLimiter.js';
 import { LLMError, isRetryable, toLLMError } from './errors.js';
@@ -35,13 +36,16 @@ const registry = new Map();   // task name → task
  * and offline; `safeDefault` is the last-resort value and must itself pass the
  * schema (checked here, at definition time).
  */
-export function defineTask({ name, schema, fallback, safeDefault, temperature = 0.2, maxTokens = 1024 }) {
+export function defineTask({ name, schema, fallback, safeDefault, temperature = 0.2, maxTokens = 1024, tier = 'strong' }) {
   if (!name || !(schema instanceof z.ZodType)) throw new TypeError('defineTask needs a name and a zod schema');
+  if (!TIERS.includes(tier)) throw new TypeError(`defineTask tier must be one of: ${TIERS.join(', ')}`);
   const ok = schema.safeParse(safeDefault);
   if (!ok.success) throw new TypeError(`safeDefault for task "${name}" fails its schema: ${z.prettifyError(ok.error)}`);
 
+  // tier picks the default model chain (llm/config.js): 'strong' = Gemini 3.8
+  // Flash first, 'fast' = Gemini 3.5 Flash-Lite first.
   const task = {
-    name, schema, temperature, maxTokens,
+    name, schema, temperature, maxTokens, tier,
     safeDefault: ok.data,
     jsonSchema: zodToJsonSchema(schema),
     fallback: fallback ?? null,
@@ -94,7 +98,7 @@ async function callProvider({ provider, model, messages, task, cfg, log, counter
   const limiter = limiterFor(provider.id);
 
   for (let retry = 0; ; retry++) {
-    const slot = await limiter.acquire(estimateTokens(messages, task.maxTokens), cfg.queueTimeoutMs);
+    const slot = await limiter.acquire(estimateTokens(messages, task.maxTokens), cfg.queueTimeoutMs, model);
     const attempt = ++counter.n;
     const controller = new AbortController();
     let timedOut = false;
@@ -119,7 +123,7 @@ async function callProvider({ provider, model, messages, task, cfg, log, counter
     } catch (thrown) {
       const err = toLLMError(thrown, { timedOut });
       const latencyMs = Date.now() - started;
-      if (err.status === 429 && err.retryAfterMs) limiter.blockFor(err.retryAfterMs);
+      if (err.status === 429 && err.retryAfterMs) limiter.blockFor(err.retryAfterMs, model);
 
       const wait = err.retryAfterMs ?? backoffMs(retry, cfg.backoffBaseMs);
       const willRetry = isRetryable(err) && retry < cfg.maxRetries && wait <= cfg.maxRetryWaitMs;
@@ -149,17 +153,24 @@ function runFallback(task, context, log) {
 
 // ─── generate ───────────────────────────────────────────────────────────────
 
-export async function generate(messages, task, { context, log = logger } = {}) {
+// `userId` (optional) counts the call against that user's AI_DAILY_LIMIT; over
+// the limit the call goes straight to the rule-based fallback.
+export async function generate(messages, task, { context, log = logger, userId } = {}) {
   if (!Array.isArray(messages) || !messages.every(m => typeof m?.content === 'string' && m.role))
     throw new TypeError('generate(messages, task): messages must be [{ role, content }]');
   if (!task?.schema || !registry.has(task.name))
     throw new TypeError('generate(messages, task): task must come from defineTask()');
 
   const cfg = runtimeConfig();
-  const chain = resolveChain();
+  let chain = resolveChain(task);
   const started = Date.now();
   const counter = { n: 0 };
   let reason = chain.length ? null : 'unconfigured';
+
+  if (userId && chain.length && !(await reserveUserCall(userId, task.name, log))) {
+    reason = 'user_daily_limit';
+    chain = [];
+  }
 
   for (const [position, link] of chain.entries()) {
     const provider = getProvider(link.provider);
@@ -178,6 +189,7 @@ export async function generate(messages, task, { context, log = logger } = {}) {
             fallbackUsed: position > 0, reason: position > 0 ? reason : null, degraded: false,
           };
           recordOutcome({ servedByPrimary: position === 0, ruleBased: false, reason });
+          if (userId) await recordUserTokens(userId, out.usage, log);
           log.info(meta, '[llm] served');
           return { data: v.data, meta };
         }
@@ -207,5 +219,5 @@ export async function generate(messages, task, { context, log = logger } = {}) {
 }
 
 export function getLLMStatus() {
-  return statusFor(resolveChain());
+  return { ...statusFor(resolveChain('strong')), fastChain: resolveChain('fast').map(l => `${l.provider}:${l.model}`) };
 }

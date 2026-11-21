@@ -104,22 +104,43 @@ The UI can tell where an answer came from:
 - `/api/ai/suggestion` returns `source`.
 - Rule-based results are cached for a shorter time (insights 30 min, tips 10 min), so the LLM gets another chance soon.
 
+### Default chain and task tiers
+
+Each task declares a tier in `defineTask({ tier })`. With `LLM_PROVIDER` and `LLM_FALLBACKS` both unset, the tier picks the chain. Providers without a key are skipped.
+
+| Tier | Used by | Chain |
+|---|---|---|
+| `strong` (default) | Insights | `gemini:GEMINI_MODEL` (3.8 Flash) → `gemini:GEMINI_MODEL_FAST` (3.5 Flash-Lite) → `openai:LLM_MODEL` (GitHub gpt-4.1-mini) → rule-based |
+| `fast` | Tips; coach and planner (planned) | `gemini:GEMINI_MODEL_FAST` → `openai:LLM_MODEL` → rule-based |
+
+So an overloaded 3.8 Flash (503 "high demand") drops to 3.5 Flash-Lite before leaving Gemini. A 429 cool-down (`Retry-After` / `retryDelay`) pauses only the model that hit it, because Gemini quotas are per model. Requests/min and tokens/min limits stay per provider.
+
+Setting `LLM_PROVIDER` or `LLM_FALLBACKS` replaces the tiered default with one explicit chain used for every task (the original Step 0 behavior).
+
+**Gemini 3 thinking.** Gemini 3+ models reject `thinkingBudget: 0` with a 400, and 3.8 Flash rejects `MINIMAL`. The provider sends `thinkingLevel` (`GEMINI_THINKING_LEVEL`, default `LOW`) to Gemini 3+ models, and `thinkingBudget` only to 2.x models. Thinking tokens share `maxTokens`, so the insight task allows 4096.
+
+**Per-user daily limit.** Pass `userId` to `generate()` to count the call against `AI_DAILY_LIMIT` (default 50 per UTC day, `0` = unlimited). Over the limit, the call goes straight to the rule-based fallback with `meta.reason = 'user_daily_limit'`. Calls and tokens per user, per day and per task are stored in `AIUsage` (kept 90 days, deleted with the account). The check fails open if Mongo errors.
+
 ### Config
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLM_PROVIDER` | `openai` if `LLM_API_KEY` is set, else `gemini` if `GEMINI_API_KEY` is set | Primary provider ID |
-| `LLM_MODEL` | `openai/gpt-4.1-mini` (openai), `GEMINI_MODEL` (gemini) | Primary model |
-| `LLM_FALLBACKS` | `gemini:<GEMINI_MODEL>` if Gemini is configured and isn't primary | Comma list of `provider:model`, or `none` |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Strong-tier Gemini model |
+| `GEMINI_MODEL_FAST` | `gemini-3.5-flash-lite` | Fast-tier model, and the strong tier's in-Gemini fallback |
+| `GEMINI_THINKING_LEVEL` | `LOW` | Gemini 3+ thinking level (`''` = omit) |
+| `AI_DAILY_LIMIT` | 50 | LLM calls per user per UTC day (`0` = unlimited) |
+| `LLM_PROVIDER` | unset (tiered default) | Primary provider ID for an explicit chain |
+| `LLM_MODEL` | `openai/gpt-4.1-mini` | Model for the `openai` link; the primary model in an explicit chain |
+| `LLM_FALLBACKS` | unset (tiered default) | Explicit chain: comma list of `provider:model`, or `none` |
 | `LLM_TIMEOUT_MS` | 20000 | Per-request timeout |
 | `LLM_MAX_RETRIES` | 2 | Transient retries per provider |
 | `LLM_MAX_RETRY_WAIT_MS` | 8000 | Longest single wait before moving on |
 | `LLM_QUEUE_TIMEOUT_MS` | 5000 | Longest wait for a local rate-limit slot |
 | `LLM_RPM_<ID>` / `LLM_TPM_<ID>` | openai 15 / 0, gemini 10 / 250000 | Per-provider limits (0 = unlimited) |
 | `LLM_API_KEY`, `LLM_BASE_URL` | GitHub Models URL | `openai` provider (any OpenAI-compatible host) |
-| `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_BASE_URL`, `GEMINI_THINKING_BUDGET` | `gemini-2.5-flash`, v1beta, `0` | `gemini` provider. Set the thinking budget to `''` to omit it. |
+| `GEMINI_API_KEY`, `GEMINI_BASE_URL`, `GEMINI_THINKING_BUDGET` | v1beta, `0` | `gemini` provider. The thinking budget applies to Gemini 2.x models only; set it to `''` to omit it. |
 
-Default model names live only in `llm/config.js`. The existing Render env (`LLM_API_KEY`, `LLM_MODEL`, `GEMINI_*`) works unchanged.
+Default model names live only in `llm/config.js`. On Render, set `GEMINI_MODEL=gemini-3.8-flash` (or delete it to use the default). A leftover `GEMINI_MODEL=gemini-2.5-flash` keeps the strong tier on 2.5, which Google reroutes to 3.5 Flash-Lite from December 1, 2026. The GitHub settings (`LLM_API_KEY`, `LLM_MODEL`) work unchanged and now act as the backup.
 
 ### Add a provider
 

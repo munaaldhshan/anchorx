@@ -2,13 +2,26 @@
 // rotations don't depend on import order). This is the ONLY file that knows
 // default model names.
 //
-//   LLM_PROVIDER     primary provider id (openai | gemini). Default: openai if
-//                    LLM_API_KEY is set, else gemini if GEMINI_API_KEY is set.
+// Default chain (LLM_PROVIDER and LLM_FALLBACKS both unset) depends on the
+// task's tier (defineTask({ tier })), skipping providers without a key:
+//
+//   strong (insights)            gemini:GEMINI_MODEL       (gemini-3.8-flash)
+//                                gemini:GEMINI_MODEL_FAST  (gemini-3.5-flash-lite)
+//                                openai:LLM_MODEL          (openai/gpt-4.1-mini, GitHub Models)
+//   fast (tips, coach, planner)  gemini:GEMINI_MODEL_FAST
+//                                openai:LLM_MODEL
+//
+// So an overloaded 3.8 Flash (503 "high demand") drops to 3.5 Flash-Lite
+// before leaving Gemini, and GitHub is the last LLM before the rule-based
+// backup.
+//
+// Explicit chain (either variable set) — the same for every task:
+//   LLM_PROVIDER     primary provider id (openai | gemini).
 //   LLM_MODEL        primary model (default depends on provider, see below).
 //   LLM_FALLBACKS    comma list of provider:model tried after the primary,
-//                    e.g. "gemini:gemini-2.5-flash". "none" = no LLM fallbacks.
-//                    Default: Gemini (GEMINI_MODEL) when it isn't the primary
-//                    and GEMINI_API_KEY is set.
+//                    e.g. "openai:openai/gpt-4.1-mini". "none" = no LLM
+//                    fallbacks. Default: Gemini (GEMINI_MODEL) when it isn't
+//                    the primary and GEMINI_API_KEY is set.
 //   LLM_TIMEOUT_MS          per-request timeout (default 20000)
 //   LLM_MAX_RETRIES         transient-error retries per provider (default 2)
 //   LLM_MAX_RETRY_WAIT_MS   longest single backoff / Retry-After we'll sit
@@ -18,12 +31,15 @@
 //   LLM_TPM_<PROVIDER>      tokens/min limit,   e.g. LLM_TPM_GEMINI (0 = none)
 //
 // Provider credentials: openai → LLM_API_KEY, LLM_BASE_URL;
-//                       gemini → GEMINI_API_KEY, GEMINI_MODEL, GEMINI_BASE_URL.
+//                       gemini → GEMINI_API_KEY, GEMINI_MODEL, GEMINI_MODEL_FAST,
+//                                GEMINI_BASE_URL.
 
 export const DEFAULT_MODELS = {
   openai: 'openai/gpt-4.1-mini',
-  gemini: 'gemini-2.5-flash',
+  gemini: 'gemini-3.8-flash',
 };
+export const DEFAULT_GEMINI_FAST_MODEL = 'gemini-3.5-flash-lite';
+export const TIERS = Object.freeze(['strong', 'fast']);
 
 // Free-tier-friendly defaults; override per deployment.
 const DEFAULT_LIMITS = {
@@ -48,8 +64,32 @@ function primaryProvider() {
   return null;
 }
 
-/** Ordered [{ provider, model }] the generate() loop walks through. */
-export function resolveChain() {
+const geminiFastModel = () => process.env.GEMINI_MODEL_FAST || DEFAULT_GEMINI_FAST_MODEL;
+
+function tieredChain(tier) {
+  const chain = [];
+  if (process.env.GEMINI_API_KEY) {
+    const strong = defaultModelFor('gemini');
+    const fast   = geminiFastModel();
+    if (tier === 'strong') chain.push({ provider: 'gemini', model: strong });
+    if (tier === 'fast' || fast !== strong) chain.push({ provider: 'gemini', model: fast });
+  }
+  if (process.env.LLM_API_KEY) {
+    chain.push({ provider: 'openai', model: process.env.LLM_MODEL || DEFAULT_MODELS.openai });
+  }
+  return chain;
+}
+
+/**
+ * Ordered [{ provider, model }] the generate() loop walks through.
+ * `task` (or a tier string) picks the default chain; see the header.
+ */
+export function resolveChain(task) {
+  const tier = (typeof task === 'string' ? task : task?.tier) === 'fast' ? 'fast' : 'strong';
+  if (process.env.LLM_PROVIDER === undefined && process.env.LLM_FALLBACKS === undefined) {
+    return tieredChain(tier);
+  }
+
   const chain = [];
   const primary = primaryProvider();
   if (primary) {

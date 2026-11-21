@@ -8,13 +8,15 @@ import { resetLimiters } from '../llm/rateLimiter.js';
 import { resetStatus } from '../llm/status.js';
 import { toStrictJsonSchema, toGeminiSchema, zodToJsonSchema } from '../llm/schema.js';
 import { parseRetryAfter } from '../llm/errors.js';
+import { thinkingConfigFor } from '../llm/providers/gemini.js';
 
 const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
 
 const ENV_KEYS = [
   'LLM_PROVIDER', 'LLM_MODEL', 'LLM_FALLBACKS', 'LLM_API_KEY', 'LLM_BASE_URL',
-  'GEMINI_API_KEY', 'GEMINI_MODEL', 'GEMINI_BASE_URL', 'GEMINI_THINKING_BUDGET',
+  'GEMINI_API_KEY', 'GEMINI_MODEL', 'GEMINI_MODEL_FAST', 'GEMINI_BASE_URL',
+  'GEMINI_THINKING_BUDGET', 'GEMINI_THINKING_LEVEL', 'AI_DAILY_LIMIT',
   'LLM_TIMEOUT_MS', 'LLM_MAX_RETRIES', 'LLM_MAX_RETRY_WAIT_MS', 'LLM_QUEUE_TIMEOUT_MS',
   'LLM_BACKOFF_BASE_MS', 'LLM_RPM_OPENAI', 'LLM_TPM_OPENAI', 'LLM_RPM_GEMINI', 'LLM_TPM_GEMINI',
 ];
@@ -60,6 +62,13 @@ const TASK = defineTask({
   fallback: (ctx) => fallbackImpl(ctx),
   safeDefault: { hour: 9, label: 'low' },
 });
+const FAST_TASK = defineTask({
+  name: 'test_fast_answer',
+  schema: Answer,
+  tier: 'fast',
+  fallback: (ctx) => fallbackImpl(ctx),
+  safeDefault: { hour: 9, label: 'low' },
+});
 const MSGS = [
   { role: 'system', content: 'You answer in JSON.' },
   { role: 'user', content: 'What hour?' },
@@ -80,7 +89,14 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-const withBoth = () => { process.env.LLM_API_KEY = 'pat'; process.env.GEMINI_API_KEY = 'gk'; };
+// The chain-mechanics tests below use an explicit two-link chain — openai
+// primary, gemini fallback — so they exercise retry/timeout/fallthrough
+// behavior independent of the default (tiered, Gemini-first) chain.
+const withBoth = () => {
+  process.env.LLM_API_KEY = 'pat';
+  process.env.GEMINI_API_KEY = 'gk';
+  process.env.LLM_PROVIDER = 'openai';
+};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 describe('resolveChain', () => {
@@ -88,13 +104,58 @@ describe('resolveChain', () => {
     expect(resolveChain()).toEqual([]);
   });
 
-  it('defaults to openai primary + gemini fallback when both keys exist (legacy env)', () => {
-    withBoth();
-    process.env.GEMINI_MODEL = 'gemini-x';
-    expect(resolveChain()).toEqual([
+  it('defaults strong tasks to Gemini 3.8 → 3.5 Flash-Lite → GitHub gpt-4.1-mini', () => {
+    process.env.LLM_API_KEY = 'pat';
+    process.env.GEMINI_API_KEY = 'gk';
+    expect(resolveChain({ tier: 'strong' })).toEqual([
+      { provider: 'gemini', model: 'gemini-3.8-flash' },
+      { provider: 'gemini', model: 'gemini-3.5-flash-lite' },
       { provider: 'openai', model: 'openai/gpt-4.1-mini' },
-      { provider: 'gemini', model: 'gemini-x' },
     ]);
+    expect(resolveChain()).toEqual(resolveChain('strong'));      // strong is the default tier
+  });
+
+  it('defaults fast tasks (tips, coach, planner) to 3.5 Flash-Lite → GitHub', () => {
+    process.env.LLM_API_KEY = 'pat';
+    process.env.GEMINI_API_KEY = 'gk';
+    expect(resolveChain({ tier: 'fast' })).toEqual([
+      { provider: 'gemini', model: 'gemini-3.5-flash-lite' },
+      { provider: 'openai', model: 'openai/gpt-4.1-mini' },
+    ]);
+  });
+
+  it('switches models with env only (GEMINI_MODEL, GEMINI_MODEL_FAST, LLM_MODEL)', () => {
+    process.env.LLM_API_KEY = 'pat';
+    process.env.GEMINI_API_KEY = 'gk';
+    process.env.GEMINI_MODEL = 'gemini-x';
+    process.env.GEMINI_MODEL_FAST = 'gemini-x-lite';
+    process.env.LLM_MODEL = 'openai/other';
+    expect(resolveChain('strong')).toEqual([
+      { provider: 'gemini', model: 'gemini-x' },
+      { provider: 'gemini', model: 'gemini-x-lite' },
+      { provider: 'openai', model: 'openai/other' },
+    ]);
+  });
+
+  it('does not repeat the same Gemini model when strong and fast are equal', () => {
+    process.env.GEMINI_API_KEY = 'gk';
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    process.env.GEMINI_MODEL_FAST = 'gemini-3.8-flash';
+    expect(resolveChain('strong')).toEqual([{ provider: 'gemini', model: 'gemini-3.8-flash' }]);
+  });
+
+  it('skips providers without a key in the default chain', () => {
+    process.env.LLM_API_KEY = 'pat';
+    expect(resolveChain('strong')).toEqual([{ provider: 'openai', model: 'openai/gpt-4.1-mini' }]);
+  });
+
+  it('keeps the legacy explicit chain (LLM_PROVIDER) identical for every tier', () => {
+    withBoth();
+    expect(resolveChain('fast')).toEqual([
+      { provider: 'openai', model: 'openai/gpt-4.1-mini' },
+      { provider: 'gemini', model: 'gemini-3.8-flash' },
+    ]);
+    expect(resolveChain('strong')).toEqual(resolveChain('fast'));
   });
 
   it('honors LLM_PROVIDER/LLM_MODEL and an explicit LLM_FALLBACKS list', () => {
@@ -104,7 +165,7 @@ describe('resolveChain', () => {
     expect(resolveChain()).toEqual([
       { provider: 'gemini', model: 'gemini-pro-y' },
       { provider: 'openai', model: 'some/model' },
-      { provider: 'gemini', model: 'gemini-2.5-flash' },
+      { provider: 'gemini', model: 'gemini-3.8-flash' },
     ]);
   });
 
@@ -162,16 +223,57 @@ describe('generate — success', () => {
 
     const { meta } = await generate(
       [...MSGS, { role: 'assistant', content: 'prev' }, { role: 'user', content: 'again' }], TASK);
-    expect(meta).toMatchObject({ source: 'llm', provider: 'gemini', model: 'gemini-2.5-flash' });
+    expect(meta).toMatchObject({ source: 'llm', provider: 'gemini', model: 'gemini-3.8-flash' });
 
     const [url, opts] = fetchMock.mock.calls[0];
-    expect(url).toContain('/models/gemini-2.5-flash:generateContent');
+    expect(url).toContain('/models/gemini-3.8-flash:generateContent');
     expect(opts.headers['x-goog-api-key']).toBe('gk');
     const body = JSON.parse(opts.body);
     expect(body.systemInstruction.parts[0].text).toBe('You answer in JSON.');
     expect(body.contents.map(c => c.role)).toEqual(['user', 'model', 'user']);
     expect(body.generationConfig.responseSchema.type).toBe('OBJECT');
-    expect(body.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 0 });
+    // Gemini 3 rejects thinkingBudget:0 with a 400 — it needs thinkingLevel.
+    expect(body.generationConfig.thinkingConfig).toEqual({ thinkingLevel: 'LOW' });
+  });
+
+  it('drops from an overloaded 3.8 Flash (503) to 3.5 Flash-Lite before leaving Gemini', async () => {
+    process.env.GEMINI_API_KEY = 'gk';
+    process.env.LLM_API_KEY = 'pat';
+    process.env.LLM_MAX_RETRIES = '0';
+    fetchMock.mockImplementation(async (url) => {
+      if (String(url).includes('gemini-3.8-flash')) return httpErr(503, {}, { error: { message: 'high demand' } });
+      if (isGemini(url)) return geminiOk(VALID);
+      throw new Error('GitHub should not be called');
+    });
+
+    const { meta } = await generate(MSGS, TASK);
+    expect(meta).toMatchObject({ source: 'llm', provider: 'gemini', model: 'gemini-3.5-flash-lite', fallbackUsed: true });
+  });
+
+  it('routes a fast-tier task straight to 3.5 Flash-Lite', async () => {
+    process.env.GEMINI_API_KEY = 'gk';
+    routeFetch({ gm: [geminiOk(VALID)] });
+
+    const { meta } = await generate(MSGS, FAST_TASK);
+    expect(meta).toMatchObject({ provider: 'gemini', model: 'gemini-3.5-flash-lite', fallbackUsed: false });
+    expect(fetchMock.mock.calls[0][0]).toContain('/models/gemini-3.5-flash-lite:generateContent');
+  });
+});
+
+describe('gemini thinking config', () => {
+  it('uses thinkingLevel for Gemini 3+ and thinkingBudget for 2.x', () => {
+    expect(thinkingConfigFor('gemini-3.8-flash')).toEqual({ thinkingLevel: 'LOW' });
+    expect(thinkingConfigFor('gemini-3.5-flash-lite')).toEqual({ thinkingLevel: 'LOW' });
+    expect(thinkingConfigFor('gemini-2.5-flash')).toEqual({ thinkingBudget: 0 });
+  });
+
+  it('honors GEMINI_THINKING_LEVEL / GEMINI_THINKING_BUDGET, and "" omits the field', () => {
+    process.env.GEMINI_THINKING_LEVEL = 'medium';
+    expect(thinkingConfigFor('gemini-3.8-flash')).toEqual({ thinkingLevel: 'MEDIUM' });
+    process.env.GEMINI_THINKING_LEVEL = '';
+    expect(thinkingConfigFor('gemini-3.8-flash')).toBe(null);
+    process.env.GEMINI_THINKING_BUDGET = '';
+    expect(thinkingConfigFor('gemini-2.5-flash')).toBe(null);
   });
 });
 
@@ -304,8 +406,9 @@ describe('generate — rate limiting', () => {
     routeFetch({ gm: [httpErr(429, {}, { error: { message: 'quota', details: [{ retryDelay: '13s' }] } })] });
 
     const { meta } = await generate(MSGS, TASK);
-    // 13s > 500ms cap → no retry, straight to the rule-based backup.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // 13s > 500ms cap → no retry on that model: one try on 3.8 Flash, one on
+    // 3.5 Flash-Lite (same quota error), then the rule-based backup.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(meta).toMatchObject({ source: 'fallback', reason: '429:gemini' });
   });
 
@@ -395,6 +498,11 @@ describe('task definition + input guards', () => {
     expect(() => defineTask({ name: 'bad', schema: Answer, safeDefault: { hour: 'x' } })).toThrow(/safeDefault/);
   });
 
+  it('rejects an unknown tier', () => {
+    expect(() => defineTask({ name: 'bad_tier', schema: Answer, tier: 'huge', safeDefault: { hour: 1, label: 'low' } }))
+      .toThrow(/tier/);
+  });
+
   it('rejects malformed messages and unregistered tasks', async () => {
     await expect(generate('hi', TASK)).rejects.toThrow(TypeError);
     await expect(generate(MSGS, { name: 'x', schema: Answer })).rejects.toThrow(TypeError);
@@ -449,7 +557,7 @@ describe('getLLMStatus', () => {
     await generate(MSGS, TASK);
     let status = getLLMStatus();
     expect(status).toMatchObject({ primary: 'failing', fallbackCount: 1, ruleBasedCount: 0, lastFallbackReason: '500:openai' });
-    expect(status.chain).toEqual(['openai:openai/gpt-4.1-mini', 'gemini:gemini-2.5-flash']);
+    expect(status.chain).toEqual(['openai:openai/gpt-4.1-mini', 'gemini:gemini-3.8-flash']);
 
     await generate(MSGS, TASK);
     status = getLLMStatus();

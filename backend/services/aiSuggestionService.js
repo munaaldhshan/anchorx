@@ -43,7 +43,8 @@ export const FOCUS_TIP_TASK = defineTask({
   name:        'focus_tip',
   schema:      TipSchema,
   temperature: 0.4,
-  maxTokens:   256,
+  maxTokens:   512,
+  tier:        'fast',        // Gemini 3.5 Flash-Lite → GitHub gpt-4.1-mini
   fallback:    ruleBasedTip,
   safeDefault: { tip: 'Pick one task, block distracting apps, and start a 25-minute session.' },
 });
@@ -132,7 +133,7 @@ export async function getSuggestion(userId) {
     throw err;
   }
 
-  const { data, meta } = await generate(buildSuggestionMessages(stats), FOCUS_TIP_TASK, { context: stats });
+  const { data, meta } = await generate(buildSuggestionMessages(stats), FOCUS_TIP_TASK, { context: stats, userId });
   const suggestion = data.tip.trim().replace(/^["']|["']$/g, '');
 
   cache.set(key, {

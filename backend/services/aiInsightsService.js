@@ -207,7 +207,9 @@ export const FOCUS_INSIGHT_TASK = defineTask({
   name:        'focus_insight',
   schema:      InsightSchema,
   temperature: 0.1,
-  maxTokens:   1024,
+  // Room for Gemini 3's (LOW) thinking tokens, which share this budget.
+  maxTokens:   4096,
+  tier:        'strong',      // Gemini 3.8 Flash → 3.5 Flash-Lite → GitHub gpt-4.1-mini
   fallback:    ruleBasedInsight,
   safeDefault: ruleBasedInsight({}),
 });
@@ -308,7 +310,7 @@ export async function getOrGenerateInsight(userId, { force = false } = {}) {
     throw err;
   }
 
-  const { data, meta } = await generate(buildInsightMessages(profile), FOCUS_INSIGHT_TASK, { context: profile });
+  const { data, meta } = await generate(buildInsightMessages(profile), FOCUS_INSIGHT_TASK, { context: profile, userId });
 
   const insight = await AIInsight.findOneAndUpdate(
     { userId },

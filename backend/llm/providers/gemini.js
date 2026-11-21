@@ -20,6 +20,26 @@ function toGeminiContents(messages) {
   return { system, contents };
 }
 
+const isGemini3Plus = (model) => /^gemini-(?:[3-9]|\d{2,})/.test(String(model));
+
+/**
+ * Thinking tokens count against maxOutputTokens (and are billed as output),
+ * so keep them low for structured JSON. The knob differs by generation:
+ *   Gemini 3+   thinkingLevel (GEMINI_THINKING_LEVEL, default LOW). These
+ *               models reject thinkingBudget:0 with a 400, and 3.8 Flash
+ *               rejects MINIMAL.
+ *   Gemini 2.x  thinkingBudget (GEMINI_THINKING_BUDGET, default 0 = off).
+ * Set either variable to '' to omit the field. Exported for tests.
+ */
+export function thinkingConfigFor(model) {
+  if (isGemini3Plus(model)) {
+    const level = process.env.GEMINI_THINKING_LEVEL ?? 'LOW';
+    return level !== '' ? { thinkingLevel: level.toUpperCase() } : null;
+  }
+  const budget = process.env.GEMINI_THINKING_BUDGET ?? '0';
+  return budget !== '' ? { thinkingBudget: Number(budget) } : null;
+}
+
 export default {
   id: 'gemini',
   isConfigured: () => Boolean(process.env.GEMINI_API_KEY),
@@ -27,16 +47,13 @@ export default {
   async complete({ model, messages, jsonSchema, temperature, maxTokens, signal }) {
     const { system, contents } = toGeminiContents(messages);
 
-    // 2.5-flash "thinks" by default and thinking tokens eat maxOutputTokens,
-    // truncating JSON. Budget 0 disables it; set GEMINI_THINKING_BUDGET='' to
-    // omit the field for models that reject it.
-    const budget = process.env.GEMINI_THINKING_BUDGET ?? '0';
+    const thinkingConfig = thinkingConfigFor(model);
     const generationConfig = {
       temperature,
       maxOutputTokens: maxTokens,
       responseMimeType: 'application/json',
       ...(jsonSchema ? { responseSchema: toGeminiSchema(jsonSchema) } : {}),
-      ...(budget !== '' ? { thinkingConfig: { thinkingBudget: Number(budget) } } : {}),
+      ...(thinkingConfig ? { thinkingConfig } : {}),
     };
 
     const res = await fetch(`${baseUrl()}/models/${encodeURIComponent(model)}:generateContent`, {

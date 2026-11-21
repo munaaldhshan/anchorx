@@ -14,7 +14,15 @@ class ProviderLimiter {
   constructor(provider) {
     this.provider = provider;
     this.entries = [];          // { at, tokens }
-    this.blockedUntil = 0;
+    // 429 cool-downs are per MODEL: provider quotas (e.g. Gemini free tier)
+    // are tracked per model, so 3.8 Flash running out must not also block
+    // 3.5 Flash-Lite. Key '' = whole provider (no model given).
+    this.blockedUntil = new Map();
+  }
+
+  blockedFor(model, now) {
+    const until = Math.max(this.blockedUntil.get('') ?? 0, model ? (this.blockedUntil.get(model) ?? 0) : 0);
+    return Math.max(0, until - now);
   }
 
   prune(now) {
@@ -22,10 +30,10 @@ class ProviderLimiter {
   }
 
   /** ms until a slot for `tokens` frees up (0 = available now). */
-  waitFor(tokens, now) {
+  waitFor(tokens, now, model) {
     const { rpm, tpm } = limitsFor(this.provider);
     this.prune(now);
-    let wait = Math.max(0, this.blockedUntil - now);
+    let wait = this.blockedFor(model, now);
     if (rpm > 0 && this.entries.length >= rpm) {
       wait = Math.max(wait, this.entries[this.entries.length - rpm].at + WINDOW_MS - now);
     }
@@ -48,11 +56,11 @@ class ProviderLimiter {
    * Reserve a slot, waiting up to maxWaitMs. Resolves to a handle whose
    * commit(actualTokens) replaces the estimate once usage is known.
    */
-  async acquire(estTokens, maxWaitMs) {
+  async acquire(estTokens, maxWaitMs, model) {
     const deadline = Date.now() + maxWaitMs;
     for (;;) {
       const now = Date.now();
-      const wait = this.waitFor(estTokens, now);
+      const wait = this.waitFor(estTokens, now, model);
       if (wait === 0) {
         const entry = { at: now, tokens: estTokens };
         this.entries.push(entry);
@@ -68,9 +76,9 @@ class ProviderLimiter {
     }
   }
 
-  /** Provider told us to back off (429 + Retry-After). */
-  blockFor(ms) {
-    this.blockedUntil = Math.max(this.blockedUntil, Date.now() + ms);
+  /** Provider told us to back off (429 + Retry-After) — for `model`, or all models. */
+  blockFor(ms, model = '') {
+    this.blockedUntil.set(model, Math.max(this.blockedUntil.get(model) ?? 0, Date.now() + ms));
   }
 }
 
