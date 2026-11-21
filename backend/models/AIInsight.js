@@ -28,7 +28,11 @@ const AIInsightSchema = new mongoose.Schema({
 
   insightText: { type: String, default: null },
 
-  modelVersion: { type: String,  default: '1.0' },
+  // Where this insight came from: 'llm' (provider/model below) or 'fallback'
+  // (rule-based, no network). Lets the UI label estimates honestly.
+  source:       { type: String,  enum: ['llm', 'fallback'], default: 'llm' },
+  provider:     { type: String,  default: null },
+  modelVersion: { type: String,  default: '1.0' },   // model id, or 'rule-based'
   trainingSize: { type: Number,  default: 0 },
   generatedAt:  { type: Date,    default: Date.now },
 }, {

@@ -38,6 +38,8 @@ type Insight = {
   };
   insightText: string;
   generatedAt: string;
+  // 'fallback' = rule-based estimate (no AI provider reachable).
+  source?: 'llm' | 'fallback';
 };
 
 type InsightResponse = {
@@ -352,7 +354,9 @@ export default function AIInsightsScreen({ nav }: { nav: NavProps }) {
             )}
           </TouchableOpacity>
 
-          <Text style={styles.timestamp}>Updated {timeAgo(insight.generatedAt)}</Text>
+          <Text style={styles.timestamp}>
+            {insight.source === 'fallback' ? 'Estimated from your stats · ' : ''}Updated {timeAgo(insight.generatedAt)}
+          </Text>
         </>
       )}
       </ScrollView>

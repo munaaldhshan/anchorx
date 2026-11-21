@@ -9,14 +9,14 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "ai:eval": "node --env-file=.env scripts/ai-eval.mjs"
+    "ai:eval": "node --env-file=.env scripts/ai-eval.mjs",
+    "migrate": "node scripts/migrate.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -30,7 +30,8 @@
     "mongoose": "^9.5.0",
     "node-cron": "^4.2.1",
     "pino": "^10.3.1",
-    "pino-http": "^11.0.0"
+    "pino-http": "^11.0.0",
+    "zod": "~4.1.13"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.1.8",

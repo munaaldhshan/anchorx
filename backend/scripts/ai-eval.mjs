@@ -7,8 +7,8 @@
 //
 // LLM answers are mildly nondeterministic, so checks assert ranges and
 // properties, never exact values.
-import { generateJSON, INSIGHT_SCHEMA, getLLMStatus, isLLMConfigured } from '../config/llm.js';
-import { buildPrompt } from '../services/aiInsightsService.js';
+import { generate, getLLMStatus } from '../llm/index.js';
+import { buildInsightMessages, FOCUS_INSIGHT_TASK } from '../services/aiInsightsService.js';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -139,23 +139,26 @@ function universalChecks(ai) {
   ];
 }
 
-if (!isLLMConfigured()) {
+if (getLLMStatus().primary === 'unconfigured') {
   console.error('No LLM configured — set LLM_API_KEY (and/or GEMINI_API_KEY) in backend/.env');
   process.exit(1);
 }
 
-console.log(`Evaluating ${PERSONAS.length} personas against ${process.env.LLM_MODEL || 'openai/gpt-4.1-mini (default)'}…\n`);
+console.log(`Evaluating ${PERSONAS.length} personas against chain ${getLLMStatus().chain.join(' → ')}…\n`);
 
 let failures = 0;
 for (const persona of PERSONAS) {
-  let ai;
-  try {
-    ai = await generateJSON(buildPrompt(persona.profile), INSIGHT_SCHEMA);
-  } catch (err) {
-    console.log(`✗ ${persona.name}\n    REQUEST FAILED: ${err.message}\n`);
+  // generate() never throws for provider errors — it falls back to the
+  // rule-based answer, which would be meaningless to evaluate, so treat it as
+  // a failure here.
+  const { data: ai, meta } = await generate(buildInsightMessages(persona.profile), FOCUS_INSIGHT_TASK,
+                                           { context: persona.profile });
+  if (meta.source !== 'llm') {
+    console.log(`✗ ${persona.name}\n    NO LLM ANSWER (rule-based fallback; reason ${meta.reason})\n`);
     failures++;
     continue;
   }
+  console.log(`  [${meta.provider}:${meta.model}, ${meta.attempts} attempt(s), ${meta.latencyMs}ms]`);
 
   const results = [...persona.checks(ai), ...universalChecks(ai)];
   const failed = results.filter(([, pass]) => !pass);
@@ -169,7 +172,7 @@ for (const persona of PERSONAS) {
 
 const status = getLLMStatus();
 if (status.fallbackCount > 0) {
-  console.log(`⚠ ${status.fallbackCount} call(s) fell back to Gemini (last reason: ${status.lastFallbackReason}) — results above may not reflect the primary model.\n`);
+  console.log(`⚠ ${status.fallbackCount} call(s) were not served by the primary (last reason: ${status.lastFallbackReason}) — results above may not reflect the primary model.\n`);
 }
 
 console.log(failures === 0

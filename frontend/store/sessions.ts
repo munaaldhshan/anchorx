@@ -7,7 +7,7 @@ export type SessionRecord = {
   id: string;
   title: string;        // custom name given by user
   categoryId: string;   // reference to the category
-  duration: number;     // actual elapsed minutes
+  duration: number;     // minutes: actual focus time once ended, else planned
   startTime: string;    // "HH:MM"
   endTime: string;      // "HH:MM"
   focusScore: number | null;
@@ -20,6 +20,8 @@ export type SessionRecord = {
   timerMode?: string;               // COUNTDOWN | POMODORO | STOPWATCH
   startedAtISO?: string | null;     // full start timestamp (ISO)
   plannedDuration?: number | null;  // planned focus minutes
+  plannedDurationSec?: number | null; // planned focus seconds (source of truth)
+  actualDurationSec?: number | null;  // real focus seconds; null until ended
   pomodoroWork?: number | null;     // minutes per focus phase
   pomodoroBreak?: number | null;    // minutes per break phase
   blockedApps?: string[];

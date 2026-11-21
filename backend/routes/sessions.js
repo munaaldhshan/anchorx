@@ -1,5 +1,5 @@
 import express from 'express';
-import Session from '../models/Session.js';
+import Session, { plannedSecOf } from '../models/Session.js';
 import FocusLog from '../models/FocusLog.js';
 import Statistics from '../models/Statistics.js';
 import User from '../models/User.js';
@@ -10,6 +10,10 @@ import {
 } from '../middleware/validate.js';
 import { invalidateSuggestion } from '../services/aiSuggestionService.js';
 import { sendPush } from '../utils/push.js';
+import { resolveTimezone, isValidTimezone, localDayOf, diffDays } from '../utils/datetime.js';
+import {
+  FOCUS_EVENT, CLIENT_LOGGABLE_EVENTS, normalizeEventMetadata,
+} from '../constants/focusEvents.js';
 
 const router = express.Router();
 
@@ -17,15 +21,62 @@ router.use(auth);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Client and server clocks can disagree slightly when endedAt is server-filled;
+// allow this much slack before clamping reported focus time to wall-clock time.
+const CLOCK_SKEW_TOLERANCE_SEC = 60;
+const MAX_PLANNED_SEC = 480 * 60;
+
 /** Compute score using the same formula as the frontend ActiveSessionScreen. */
-function computeFocusScore(actualMins, plannedMins, isPomo, distractionCount) {
-  const ratio    = Math.min(1, actualMins / Math.max(1, plannedMins));
+export function computeFocusScore(actualSec, plannedSec, isPomo, distractionCount) {
+  const ratio    = Math.min(1, actualSec / Math.max(60, plannedSec));
   const pomoBon  = isPomo ? 8 : 0;
   const penalty  = Math.min(24, distractionCount * 4);
   return Math.min(99, Math.max(20, Math.round(ratio * 80) + pomoBon - penalty + 12));
 }
 
 /** Validate + normalize the blockedApps array (≤50 items, each ≤200 chars). */
+/** Parse an optional ISO timestamp from the body; 400 on garbage. */
+function parseInstant(v, field) {
+  if (v === undefined || v === null || v === '') return null;
+  const d = new Date(v);
+  if (typeof v !== 'string' && typeof v !== 'number') throw badRequest(`${field} must be an ISO timestamp`);
+  if (Number.isNaN(d.getTime())) throw badRequest(`${field} must be an ISO timestamp`);
+  return d;
+}
+
+/**
+ * Which local day a session counts toward. New clients send `timezone`, and
+ * the day is derived from startedAt in that zone. Older app builds send only a
+ * device-local `dateStr`: it is trusted when it's within a day of the derived
+ * value (settings.timezone may lag a device that just changed zone), else the
+ * derived value wins.
+ */
+export function resolveSessionDay({ startedAt, clientTz, clientDateStr, userTz }) {
+  if (clientTz) return localDayOf(startedAt, clientTz);
+  const derived = localDayOf(startedAt, userTz);
+  if (clientDateStr && Math.abs(diffDays(derived, clientDateStr)) <= 1) return clientDateStr;
+  return derived;
+}
+
+/** Planned focus seconds from either the new or the legacy (minutes) field. */
+function readPlannedSec(body) {
+  if (body.plannedDurationSec !== undefined)
+    return requireInt(body.plannedDurationSec, { min: 60, max: MAX_PLANNED_SEC, field: 'plannedDurationSec' });
+  if (body.timerConfig?.plannedDuration !== undefined)
+    return 60 * requireInt(body.timerConfig.plannedDuration, { min: 1, max: 480, field: 'timerConfig.plannedDuration' });
+  throw badRequest('plannedDurationSec is required');
+}
+
+/** Client-reported focus seconds (new or legacy minutes field), or null. */
+function readReportedActualSec(body) {
+  if (body.actualDurationSec !== undefined && body.actualDurationSec !== null)
+    return requireInt(body.actualDurationSec, { min: 0, max: 24 * 3600, field: 'actualDurationSec' });
+  const legacy = body.timerState?.actualDuration;
+  if (legacy !== undefined && legacy !== null)
+    return 60 * requireInt(legacy, { min: 0, max: 24 * 60, field: 'timerState.actualDuration' });
+  return null;
+}
+
 function validateBlockedApps(arr) {
   if (arr === undefined || arr === null) return [];
   if (!Array.isArray(arr)) throw badRequest('blockedApps must be an array');
@@ -57,22 +108,27 @@ router.get('/', asyncHandler(async (req, res) => {
     .sort({ dateStr: -1, startedAt: -1 })
     .limit(Number(req.query.limit) || 100);
 
-  const tz = req.user.settings?.timezone || 'UTC';
+  const tz = resolveTimezone(req.user);
   res.json(sessions.map(s => Session.toFrontendRecord(s, tz)));
 }));
 
 // ─── POST /api/sessions ───────────────────────────────────────────────────────
 // Create a new session (ACTIVE state) when the user taps "Start".
-// Body: { categoryId, customName, timerMode, timerConfig, blockedApps, dateStr, startedAt, nfcTagUid? }
+// Body: { categoryId, customName, timerMode, plannedDurationSec, timerConfig?,
+//         blockedApps, startedAt, timezone?, dateStr? (legacy), nfcTagUid? }
+// timerConfig.plannedDuration (minutes) is still accepted from older builds.
 router.post('/', asyncHandler(async (req, res) => {
-  const { categoryId, customName, timerMode, timerConfig, blockedApps, dateStr, startedAt, nfcTagUid } = req.body;
+  const { categoryId, customName, timerMode, blockedApps, dateStr, nfcTagUid } = req.body;
+  const timerConfig = req.body.timerConfig ?? {};
 
-  requireDateStr(dateStr);
+  if (dateStr !== undefined) requireDateStr(dateStr);
   const categoryIdStr = requireString(categoryId, { field: 'categoryId' });
   const customNameStr = customName ? requireString(customName, { max: 100, field: 'customName' }) : 'Untitled';
-  
-  if (!timerConfig || typeof timerConfig !== 'object')
-    throw badRequest('timerConfig is required');
+
+  if (typeof timerConfig !== 'object' || Array.isArray(timerConfig))
+    throw badRequest('timerConfig must be an object');
+  if (req.body.timezone !== undefined && !isValidTimezone(req.body.timezone))
+    throw badRequest('timezone must be a valid IANA timezone');
 
   // Validate that the category exists for this user
   const category = req.user.categories?.find(c => c.id === categoryIdStr);
@@ -82,7 +138,7 @@ router.post('/', asyncHandler(async (req, res) => {
     ? 'COUNTDOWN'
     : requireEnum(timerMode, ['COUNTDOWN', 'POMODORO', 'STOPWATCH'], { field: 'timerMode' });
 
-  const plannedDuration = requireInt(timerConfig.plannedDuration, { min: 1, max: 480, field: 'timerConfig.plannedDuration' });
+  const plannedDurationSec = readPlannedSec(req.body);
   const pomodoroWork = timerConfig.pomodoroWork === undefined
     ? req.user.settings.pomodoroWork
     : requireInt(timerConfig.pomodoroWork, { min: 1, max: 60, field: 'timerConfig.pomodoroWork' });
@@ -95,32 +151,45 @@ router.post('/', asyncHandler(async (req, res) => {
 
   const apps = validateBlockedApps(blockedApps);
 
+  const userTz    = resolveTimezone(req.user);
+  const sessionTz = req.body.timezone ?? userTz;
+  const startedAt = parseInstant(req.body.startedAt, 'startedAt') ?? new Date();
+
   const session = await Session.create({
     userId:      req.user._id,
     categoryId:  categoryIdStr,
     customName:  customNameStr,
     status:      'ACTIVE',
     timerMode:   finalMode,
-    timerConfig: { plannedDuration, pomodoroWork, pomodoroBreak, pomodoroRounds },
+    timerConfig: {
+      // Legacy minutes, dual-written for rollback safety (see models/Session.js).
+      plannedDuration: Math.max(1, Math.round(plannedDurationSec / 60)),
+      pomodoroWork, pomodoroBreak, pomodoroRounds,
+    },
+    plannedDurationSec,
     blockedApps: apps,
-    dateStr,
-    startedAt:   startedAt ? new Date(startedAt) : new Date(),
+    dateStr:     resolveSessionDay({
+      startedAt, clientTz: req.body.timezone, clientDateStr: dateStr, userTz,
+    }),
+    timezone:    sessionTz,
+    startedAt,
     nfcTagUid:   nfcTagUid || null,
   });
 
   await FocusLog.create({
     sessionId: session._id,
     userId:    req.user._id,
-    event:     'SESSION_STARTED',
+    event:     FOCUS_EVENT.SESSION_STARTED,
     timestamp: session.startedAt,
   });
 
-  const tz = req.user.settings?.timezone || 'UTC';
+  const tz = userTz;
   res.status(201).json(Session.toFrontendRecord(session, tz));
 }));
 
 // ─── PATCH /api/sessions/:id/end ─────────────────────────────────────────────
-// Body: { status: 'COMPLETED'|'ABANDONED', timerState, endedAt?, nfcTagUid? }
+// Body: { status: 'COMPLETED'|'ABANDONED', actualDurationSec?, endedAt?, nfcTagUid?,
+//         timerState? (pomodoroRoundsCompleted, breaks; legacy actualDuration minutes) }
 router.patch('/:id/end', asyncHandler(async (req, res) => {
   requireObjectId(req.params.id);
 
@@ -129,20 +198,27 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
   if (session.status !== 'ACTIVE')
     return res.status(400).json({ message: `Session is already ${session.status}` });
 
-  const { status, timerState, endedAt, nfcTagUid } = req.body;
+  const { status, timerState, nfcTagUid } = req.body;
   const finalStatus = ['COMPLETED', 'ABANDONED'].includes(status) ? status : 'ABANDONED';
-  const endTime     = endedAt ? new Date(endedAt) : new Date();
+  const endTime     = parseInstant(req.body.endedAt, 'endedAt') ?? new Date();
+  const startTime   = session.startedAt ?? session.createdAt;
+  if (endTime < startTime) throw badRequest('endedAt must not be before the session start');
+
+  // actualDurationSec = focus time the client measured (excludes pauses and
+  // Pomodoro breaks), bounded by real wall-clock time between the UTC start
+  // and end instants. Without a client figure, wall-clock time is used.
+  const wallSec     = Math.floor((endTime - startTime) / 1000);
+  const reportedSec = readReportedActualSec(req.body);
+  const actualDurationSec = reportedSec === null
+    ? wallSec
+    : Math.min(reportedSec, wallSec + CLOCK_SKEW_TOLERANCE_SEC);
 
   // Focus score is computed server-side from authoritative sources only.
   // Client-supplied focusScore / distractionCount values are ignored.
-  const actualMins       = timerState?.actualDuration || 0;
-  const distractionCount = await FocusLog.countDocuments({
-    sessionId: session._id,
-    event:     'APP_BLOCKED',
-  });
+  const distractionCount = await FocusLog.countDistractions(session._id);
   const isPomo     = session.timerMode === 'POMODORO';
   const focusScore = finalStatus === 'COMPLETED'
-    ? computeFocusScore(actualMins, session.timerConfig.plannedDuration, isPomo, distractionCount)
+    ? computeFocusScore(actualDurationSec, plannedSecOf(session) ?? 0, isPomo, distractionCount)
     : null;
 
   // Atomic transition: the guard on status:'ACTIVE' means only the first of two
@@ -153,8 +229,10 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
     {
       $set: {
         status:     finalStatus,
+        actualDurationSec,
         timerState: {
-          actualDuration:          timerState?.actualDuration          ?? 0,
+          // Legacy minutes, dual-written for rollback safety.
+          actualDuration:          Math.round(actualDurationSec / 60),
           pomodoroRoundsCompleted: timerState?.pomodoroRoundsCompleted ?? 0,
           breaks:                  timerState?.breaks                  ?? 0,
         },
@@ -171,21 +249,21 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
     await FocusLog.create({
       sessionId: updated._id,
       userId:    req.user._id,
-      event:     'NFC_VERIFIED',
+      event:     FOCUS_EVENT.NFC_VERIFIED,
       timestamp: endTime,
-      metadata:  { uid: nfcTagUid },
+      metadata:  { tagUid: String(nfcTagUid).slice(0, 100) },
     });
   }
 
   await FocusLog.create({
     sessionId: updated._id,
     userId:    req.user._id,
-    event:     'SESSION_ENDED',
+    event:     FOCUS_EVENT.SESSION_ENDED,
     timestamp: endTime,
     metadata:  { reason: finalStatus },
   });
 
-  const tz = req.user.settings?.timezone || 'UTC';
+  const tz = resolveTimezone(req.user);
 
   // Snapshot today's minutes before rebuilding so we can detect the goal crossing.
   const prevStat = await Statistics.findOne(
@@ -226,24 +304,41 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
   res.json({
     session: Session.toFrontendRecord(updated, tz),
     streak:  streakData.streak,
+    distractionCount,
   });
 }));
 
 // ─── POST /api/sessions/:id/log ───────────────────────────────────────────────
-// Append a focus event during an active session. Body: { event, metadata? }
+// Append a client-observed event to an ACTIVE session.
+// Body: { event: APP_BLOCKED|DISTRACTION|BREAK_STARTED|BREAK_ENDED,
+//         metadata?: { appName?, packageName?, source? }, timestamp? (ISO) }
+// See constants/focusEvents.js for semantics.
 router.post('/:id/log', asyncHandler(async (req, res) => {
   requireObjectId(req.params.id);
 
+  const event = requireEnum(req.body.event, CLIENT_LOGGABLE_EVENTS, { field: 'event' });
+  const { metadata, error } = normalizeEventMetadata(req.body.metadata);
+  if (error) throw badRequest(error);
+
   const session = await Session.findOne({ _id: req.params.id, userId: req.user._id });
   if (!session) return res.status(404).json({ message: 'Session not found' });
+  // Scoring happens at /end, so events after that would silently disagree
+  // with the stored score.
+  if (session.status !== 'ACTIVE')
+    return res.status(409).json({ message: `Session is already ${session.status}` });
 
-  const { event, metadata } = req.body;
+  // A client may queue events briefly offline; accept its timestamp when it
+  // lies inside the session, otherwise stamp server time.
+  const now = new Date();
+  const ts  = parseInstant(req.body.timestamp, 'timestamp');
+  const timestamp = ts && ts >= session.startedAt && ts <= now ? ts : now;
+
   const log = await FocusLog.create({
     sessionId: session._id,
     userId:    req.user._id,
     event,
-    timestamp: new Date(),
-    metadata:  metadata || {},
+    timestamp,
+    metadata,
   });
 
   res.status(201).json(log);
@@ -267,7 +362,7 @@ router.delete('/:id', asyncHandler(async (req, res) => {
   if (!session) return res.status(404).json({ message: 'Session not found' });
 
   await FocusLog.deleteMany({ sessionId: session._id });
-  const tz = req.user.settings?.timezone || 'UTC';
+  const tz = resolveTimezone(req.user);
   await syncStats(req.user._id, session.dateStr, tz);
 
   invalidateSuggestion(req.user._id);

@@ -167,12 +167,18 @@ export default function ActiveSessionScreen({ nav }: { nav: NavProps }) {
         categoryId:   nav.params.categoryId || 'uncategorized',
         customName:   nav.params.customName || 'Untitled',
         timerMode:   isPomo ? 'POMODORO' : 'COUNTDOWN',
+        // Planned focus time in seconds; the legacy minutes field is kept
+        // so this build also works against a not-yet-upgraded backend.
+        plannedDurationSec: parseInt(nav.params.plannedDuration ?? '45') * 60,
         timerConfig: {
           plannedDuration: parseInt(nav.params.plannedDuration ?? '45'),
           pomodoroWork:    pomoWork,
           pomodoroBreak:   pomoBreak,
         },
         blockedApps,
+        // The server derives the session's day from startedAt in this zone;
+        // dateStr is still sent for older backends.
+        timezone:    Intl.DateTimeFormat().resolvedOptions().timeZone,
         dateStr:     toDateStr(now),
         startedAt:   now.toISOString(),
         nfcTagUid:   nfcTag,
@@ -425,15 +431,14 @@ export default function ActiveSessionScreen({ nav }: { nav: NavProps }) {
     const elapsed         = focusElapsedSecs();
     const actualMinutes   = Math.max(1, Math.round(elapsed / 60));
     const completionRatio = Math.min(1, elapsed / Math.max(1, totalSecs));
-    const distractionsVal = Math.max(
-      0,
-      Math.floor(actualMinutes / 20) + (completionRatio < 0.9 ? 1 : 0),
-    );
+    // Distractions are counted server-side from APP_BLOCKED + DISTRACTION
+    // focus-log events and returned by /end. This local score is only the
+    // offline fallback, so it assumes none were recorded.
+    let distractionsVal = 0;
     const pomoBon = isPomo ? 8 : 0;
-    const penalty = Math.min(24, distractionsVal * 4);
     const score   = Math.min(
       99,
-      Math.max(20, Math.round(completionRatio * 80) + pomoBon - penalty + 12),
+      Math.max(20, Math.round(completionRatio * 80) + pomoBon + 12),
     );
     const endedAt = new Date();
     const finalStatus = remaining === 0 ? 'COMPLETED' : 'ABANDONED';
@@ -443,21 +448,25 @@ export default function ActiveSessionScreen({ nav }: { nav: NavProps }) {
 
     if (nav.token && sessionIdRef.current) {
       try {
-        const res = await apiFetch<{ session: { focusScore: number | null }; streak: number }>(
+        const res = await apiFetch<{
+          session: { focusScore: number | null };
+          streak: number;
+          distractionCount?: number;
+        }>(
           `/sessions/${sessionIdRef.current}/end`, nav.token, {
             method: 'PATCH',
             body: JSON.stringify({
-              status:           finalStatus,
-              timerState:       { actualDuration: actualMinutes },
-              focusScore:       score,
-              distractionCount: distractionsVal,
-              endedAt:          endedAt.toISOString(),
+              status:            finalStatus,
+              actualDurationSec: Math.round(elapsed),
+              timerState:        { actualDuration: actualMinutes },   // legacy backends
+              endedAt:           endedAt.toISOString(),
               nfcTagUid,
             }),
           },
         );
-        finalScore = res.session.focusScore ?? score;
-        streak     = String(res.streak);
+        finalScore      = res.session.focusScore ?? score;
+        streak          = String(res.streak);
+        distractionsVal = res.distractionCount ?? 0;
         nav.refreshSessions();
       } catch {
         // Network failure — continue with local values
