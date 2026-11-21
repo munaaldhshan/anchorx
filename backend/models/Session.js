@@ -1,5 +1,32 @@
 import mongoose from 'mongoose';
 import { formatLocalHHMM } from '../utils/datetime.js';
+import { openBreak, allowanceRemaining } from '../utils/breaks.js';
+
+// ── Custom Breaks (COUNTDOWN / STOPWATCH) — see utils/breaks.js ──
+const PlannedBreakSchema = new mongoose.Schema({
+  startAfter: { type: Number, required: true },   // focus MINUTES into the session
+  duration:   { type: Number, required: true },   // minutes
+}, { _id: false });
+
+const BreakAllowanceSchema = new mongoose.Schema({
+  maxBreaks:  { type: Number, default: null },    // null = no count limit
+  maxMinutes: { type: Number, default: null },    // null = no minutes limit
+}, { _id: false });
+
+const BreakPlanSchema = new mongoose.Schema({
+  planned:               { type: [PlannedBreakSchema], default: [] },
+  allowance:             { type: BreakAllowanceSchema, default: null },  // null = no on-demand breaks
+  unlockAppsDuringBreak: { type: Boolean, default: false },
+}, { _id: false });
+
+const BreakSchema = new mongoose.Schema({
+  type:         { type: String, enum: ['PLANNED', 'ON_DEMAND'], required: true },
+  plannedIndex: { type: Number, default: null },  // index into breakPlan.planned (PLANNED only)
+  duration:     { type: Number, required: true }, // minutes requested / planned
+  startedAt:    { type: Date,   required: true }, // UTC, server time
+  endedAt:      { type: Date,   default: null },  // UTC; null = break in progress
+  endedEarly:   { type: Boolean, default: false },
+}, { _id: false });
 
 // Durations: the source of truth is the top-level `plannedDurationSec` /
 // `actualDurationSec` (integer SECONDS). The legacy minute fields
@@ -12,12 +39,13 @@ const TimerConfigSchema = new mongoose.Schema({
   pomodoroWork:      { type: Number, default: 25  },    
   pomodoroBreak:     { type: Number, default: 5   },    
   pomodoroRounds:    { type: Number, default: 4   },
+  breakPlan:         { type: BreakPlanSchema, default: null },  // Custom Breaks; null = none
 }, { _id: false });
 
 const TimerStateSchema = new mongoose.Schema({
   actualDuration:          { type: Number, default: 0 },  // DEPRECATED (minutes) — see actualDurationSec
   pomodoroRoundsCompleted: { type: Number, default: 0 },
-  breaks:                  { type: Number, default: 0 },
+  breaks:                  { type: Number, default: 0 },  // Pomodoro breaks, or Custom Breaks taken
 }, { _id: false });
 
 const SessionSchema = new mongoose.Schema({
@@ -58,6 +86,10 @@ const SessionSchema = new mongoose.Schema({
   actualDurationSec:  { type: Number, default: null, min: 0 },
   timerState:  { type: TimerStateSchema,  default: () => ({}) },
   blockedApps: { type: [String], default: [] },
+  // Custom Breaks actually taken, with server-recorded start/end instants.
+  breaks:      { type: [BreakSchema], default: [] },
+  // Total Custom Break time, set at end. Never counted as focus time.
+  breakDurationSec: { type: Number, default: 0, min: 0 },
   focusScore: { type: Number, default: null, min: 0, max: 100 },
   // Local calendar day (YYYY-MM-DD) of startedAt in `timezone` — the day this
   // session counts toward for stats/streaks. Derived server-side.
@@ -102,6 +134,7 @@ SessionSchema.statics.toFrontendRecord = function (doc, tz = 'UTC') {
   const plannedSec = plannedSecOf(doc);
   const actualSec  = actualSecOf(doc);
   const toMin = (sec) => (sec === null ? null : Math.round(sec / 60));
+  const open  = openBreak(doc);
 
   return {
     id:         doc._id.toString(),
@@ -128,7 +161,38 @@ SessionSchema.statics.toFrontendRecord = function (doc, tz = 'UTC') {
     pomodoroWork:    doc.timerConfig?.pomodoroWork    ?? null,
     pomodoroBreak:   doc.timerConfig?.pomodoroBreak   ?? null,
     blockedApps:     doc.blockedApps ?? [],
+
+    // Custom Breaks. activeBreak lets the client resume mid-break after an app kill.
+    breakPlan:          breakPlanRecord(doc.timerConfig?.breakPlan),
+    breaks:             (doc.breaks ?? []).map(breakRecord),
+    activeBreak:        open ? breakRecord(open) : null,
+    breakDurationSec:   doc.breakDurationSec ?? 0,
+    breakMinutes:       Math.round((doc.breakDurationSec ?? 0) / 60),
+    breaksTaken:        doc.breaks?.length ?? 0,
+    allowanceRemaining: allowanceRemaining(doc),
   };
 };
+
+function breakRecord(b) {
+  return {
+    type:         b.type,
+    plannedIndex: b.plannedIndex ?? null,
+    duration:     b.duration,
+    startedAtISO: new Date(b.startedAt).toISOString(),
+    endedAtISO:   b.endedAt ? new Date(b.endedAt).toISOString() : null,
+    endedEarly:   Boolean(b.endedEarly),
+  };
+}
+
+function breakPlanRecord(plan) {
+  if (!plan) return null;
+  return {
+    planned:   (plan.planned ?? []).map(p => ({ startAfter: p.startAfter, duration: p.duration })),
+    allowance: plan.allowance
+      ? { maxBreaks: plan.allowance.maxBreaks ?? null, maxMinutes: plan.allowance.maxMinutes ?? null }
+      : null,
+    unlockAppsDuringBreak: Boolean(plan.unlockAppsDuringBreak),
+  };
+}
 
 export default mongoose.model('Session', SessionSchema);

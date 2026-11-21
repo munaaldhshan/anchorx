@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { localHourOf, userTodayStr, shiftDateStr } from '../utils/datetime.js';
 import { actualSecOf } from './Session.js';
 import { FOCUS_EVENT, eventAppKey } from '../constants/focusEvents.js';
+import { breakWindows, isDuringBreak } from '../utils/breaks.js';
 
 const StatisticsSchema = new mongoose.Schema({
   userId: {
@@ -63,8 +64,14 @@ StatisticsSchema.statics.rebuildForDay = async function (userId, dateStr, tz = '
     sessionId: { $in: sessionIds },
     event:     FOCUS_EVENT.APP_BLOCKED,
   });
+  // Blocks that land inside a Custom Break aren't temptations (focus time only).
+  const windowsBySession = new Map(
+    daySessions.filter(s => s.breaks?.length).map(s => [String(s._id), breakWindows(s)]),
+  );
   const pkgCounts = {};
   for (const log of blockedLogs) {
+    const windows = windowsBySession.get(String(log.sessionId));
+    if (windows && isDuringBreak(log.timestamp, windows)) continue;
     const pkg = eventAppKey(log);
     if (pkg) pkgCounts[pkg] = (pkgCounts[pkg] || 0) + 1;
   }

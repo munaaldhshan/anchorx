@@ -14,6 +14,10 @@ import { resolveTimezone, isValidTimezone, localDayOf, diffDays } from '../utils
 import {
   FOCUS_EVENT, CLIENT_LOGGABLE_EVENTS, normalizeEventMetadata,
 } from '../constants/focusEvents.js';
+import {
+  BREAK_TYPES, MAX_BREAK_LEN, validateBreakPlan, openBreak, breakDeadline, clampBreakEnd,
+  allowanceRemaining, totalBreakSec, hasCustomBreaks,
+} from '../utils/breaks.js';
 
 const router = express.Router();
 
@@ -151,7 +155,10 @@ router.post('/', asyncHandler(async (req, res) => {
 
   const apps = validateBlockedApps(blockedApps);
 
-  const userTz    = resolveTimezone(req.user);
+  // Custom Breaks (optional). Rejected for POMODORO, which has its own cycle.
+  const breakPlan = validateBreakPlan(timerConfig.breakPlan, { timerMode: finalMode, plannedDurationSec });
+
+  const userTz   = resolveTimezone(req.user);
   const sessionTz = req.body.timezone ?? userTz;
   const startedAt = parseInstant(req.body.startedAt, 'startedAt') ?? new Date();
 
@@ -165,6 +172,7 @@ router.post('/', asyncHandler(async (req, res) => {
       // Legacy minutes, dual-written for rollback safety (see models/Session.js).
       plannedDuration: Math.max(1, Math.round(plannedDurationSec / 60)),
       pomodoroWork, pomodoroBreak, pomodoroRounds,
+      breakPlan,
     },
     plannedDurationSec,
     blockedApps: apps,
@@ -209,13 +217,27 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
   // and end instants. Without a client figure, wall-clock time is used.
   const wallSec     = Math.floor((endTime - startTime) / 1000);
   const reportedSec = readReportedActualSec(req.body);
+
+  // Custom Breaks: close a break still open at session end (clamped to its
+  // length), then take break time out of the wall-clock bound so it can never
+  // be reported as focus time.
+  const customBreaks = hasCustomBreaks(session);
+  const breaks = (session.breaks ?? []).map(b => b.toObject());
+  const autoClosed = [];
+  for (const b of breaks) {
+    if (!b.endedAt) { Object.assign(b, clampBreakEnd(b, endTime)); autoClosed.push(b); }
+  }
+  const breakDurationSec = customBreaks ? totalBreakSec({ breaks }) : 0;
+  const focusWallSec     = Math.max(0, wallSec - breakDurationSec);
+
   const actualDurationSec = reportedSec === null
-    ? wallSec
-    : Math.min(reportedSec, wallSec + CLOCK_SKEW_TOLERANCE_SEC);
+    ? focusWallSec
+    : Math.min(reportedSec, focusWallSec + CLOCK_SKEW_TOLERANCE_SEC);
 
   // Focus score is computed server-side from authoritative sources only.
   // Client-supplied focusScore / distractionCount values are ignored.
-  const distractionCount = await FocusLog.countDistractions(session._id);
+  // Distractions during a Custom Break don't count (focus time only).
+  const distractionCount = await FocusLog.countFocusDistractions({ _id: session._id, breaks });
   const isPomo     = session.timerMode === 'POMODORO';
   const focusScore = finalStatus === 'COMPLETED'
     ? computeFocusScore(actualDurationSec, plannedSecOf(session) ?? 0, isPomo, distractionCount)
@@ -224,8 +246,12 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
   // Atomic transition: the guard on status:'ACTIVE' means only the first of two
   // racing end requests wins. The loser gets null and does no side effects, so
   // logs and stats can't be double-counted.
+  // For Custom Breaks the break array must be unchanged since we read it, so a
+  // break started concurrently can't be left open on an ended session.
+  const endFilter = { _id: session._id, userId: req.user._id, status: 'ACTIVE' };
+  if (customBreaks) endFilter.breaks = { $size: breaks.length };
   const updated = await Session.findOneAndUpdate(
-    { _id: session._id, userId: req.user._id, status: 'ACTIVE' },
+    endFilter,
     {
       $set: {
         status:     finalStatus,
@@ -234,15 +260,31 @@ router.patch('/:id/end', asyncHandler(async (req, res) => {
           // Legacy minutes, dual-written for rollback safety.
           actualDuration:          Math.round(actualDurationSec / 60),
           pomodoroRoundsCompleted: timerState?.pomodoroRoundsCompleted ?? 0,
-          breaks:                  timerState?.breaks                  ?? 0,
+          // Custom Breaks: server-counted; Pomodoro: client-reported.
+          breaks: customBreaks ? breaks.length : (timerState?.breaks ?? 0),
         },
+        ...(customBreaks ? { breaks, breakDurationSec } : {}),
         focusScore,
         endedAt: endTime,
       },
     },
     { returnDocument: 'after' },
   );
-  if (!updated) return res.status(409).json({ message: 'Session already ended' });
+  if (!updated) return res.status(409).json({ message: 'Session already ended or changed; retry' });
+
+  for (const b of autoClosed) {
+    await FocusLog.create({
+      sessionId: updated._id,
+      userId:    req.user._id,
+      event:     FOCUS_EVENT.BREAK_ENDED,
+      timestamp: b.endedAt,
+      metadata:  {
+        reason:     b.endedEarly ? 'SESSION_ENDED' : 'ELAPSED',
+        breakType:  b.type,
+        breakIndex: b.plannedIndex,
+      },
+    });
+  }
 
   // Log NFC_VERIFIED before SESSION_ENDED so the event order is chronological.
   if (nfcTagUid) {
@@ -327,6 +369,12 @@ router.post('/:id/log', asyncHandler(async (req, res) => {
   if (session.status !== 'ACTIVE')
     return res.status(409).json({ message: `Session is already ${session.status}` });
 
+  // Client-logged BREAK_* events are for Pomodoro only. Custom Breaks are
+  // recorded by the server via /breaks/start and /breaks/end.
+  if (session.timerMode !== 'POMODORO' &&
+      (event === FOCUS_EVENT.BREAK_STARTED || event === FOCUS_EVENT.BREAK_ENDED))
+    throw badRequest('Use /breaks/start and /breaks/end for breaks in this session');
+
   // A client may queue events briefly offline; accept its timestamp when it
   // lies inside the session, otherwise stamp server time.
   const now = new Date();
@@ -342,6 +390,135 @@ router.post('/:id/log', asyncHandler(async (req, res) => {
   });
 
   res.status(201).json(log);
+}));
+
+// ─── Custom Breaks ───────────────────────────────────────────────────────────
+// COUNTDOWN / STOPWATCH sessions with a timerConfig.breakPlan. The server
+// records every break's real start/end so allowance, focus time and
+// temptation counting can't be gamed by the client. See utils/breaks.js.
+
+function breakFail(res, status, code, message) {
+  return res.status(status).json({ code, message });
+}
+
+// A break whose time ran out but was never closed (e.g. the app was killed):
+// close it at its deadline so it doesn't block the next break.
+async function closeElapsedBreak(session, userId, now) {
+  const open = openBreak(session);
+  if (!open || breakDeadline(open) > now) return session;
+  const deadline = breakDeadline(open);
+  const updated = await Session.findOneAndUpdate(
+    { _id: session._id, userId, breaks: { $elemMatch: { startedAt: open.startedAt, endedAt: null } } },
+    { $set: { 'breaks.$.endedAt': deadline, 'breaks.$.endedEarly': false } },
+    { returnDocument: 'after' },
+  );
+  if (!updated) return Session.findOne({ _id: session._id, userId });
+  await FocusLog.create({
+    sessionId: session._id, userId, event: FOCUS_EVENT.BREAK_ENDED, timestamp: deadline,
+    metadata:  { reason: 'ELAPSED', breakType: open.type, breakIndex: open.plannedIndex },
+  });
+  return updated;
+}
+
+// ─── POST /api/sessions/:id/breaks/start ─────────────────────────────────────
+// Body: { type: 'PLANNED', plannedIndex } | { type: 'ON_DEMAND', duration (min) }
+router.post('/:id/breaks/start', asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id);
+  const type = requireEnum(req.body.type, BREAK_TYPES, { field: 'type' });
+
+  let session = await Session.findOne({ _id: req.params.id, userId: req.user._id });
+  if (!session) return res.status(404).json({ message: 'Session not found' });
+  if (session.status !== 'ACTIVE')
+    return breakFail(res, 409, 'SESSION_NOT_ACTIVE', `Session is already ${session.status}`);
+  const plan = session.timerConfig?.breakPlan;
+  if (!plan) throw badRequest('This session has no break plan');
+
+  const now = new Date();
+  session = await closeElapsedBreak(session, req.user._id, now);
+  if (openBreak(session))
+    return breakFail(res, 409, 'BREAK_ALREADY_OPEN', 'A break is already in progress');
+
+  let brk;
+  if (type === 'PLANNED') {
+    if (!plan.planned?.length) throw badRequest('This session has no planned breaks');
+    const idx = requireInt(req.body.plannedIndex, { min: 0, max: plan.planned.length - 1, field: 'plannedIndex' });
+    if (session.breaks.some(b => b.type === 'PLANNED' && b.plannedIndex === idx))
+      return breakFail(res, 409, 'PLANNED_BREAK_TAKEN', 'This planned break was already taken');
+    // Focus time can't exceed wall-clock time, so a break isn't due before
+    // startAfter minutes of wall-clock time have passed (with clock slack).
+    const wallSec = (now - (session.startedAt ?? session.createdAt)) / 1000;
+    if (wallSec + CLOCK_SKEW_TOLERANCE_SEC < plan.planned[idx].startAfter * 60)
+      return breakFail(res, 409, 'PLANNED_BREAK_NOT_DUE', 'This planned break is not due yet');
+    brk = { type, plannedIndex: idx, duration: plan.planned[idx].duration, startedAt: now };
+  } else {
+    const duration = requireInt(req.body.duration, { min: 1, max: MAX_BREAK_LEN, field: 'duration' });
+    const left = allowanceRemaining(session);
+    if ((left.breaks !== null && left.breaks < 1) || (left.minutes !== null && left.minutes < duration))
+      return breakFail(res, 403, 'ALLOWANCE_EXCEEDED', 'Break allowance exceeded for this session');
+    brk = { type, plannedIndex: null, duration, startedAt: now };
+  }
+
+  // The $size guard makes the open-break and allowance checks race-safe: two
+  // concurrent starts can't both push.
+  const updated = await Session.findOneAndUpdate(
+    { _id: session._id, userId: req.user._id, status: 'ACTIVE', breaks: { $size: session.breaks.length } },
+    { $push: { breaks: brk } },
+    { returnDocument: 'after' },
+  );
+  if (!updated) {
+    const fresh = await Session.findOne({ _id: session._id, userId: req.user._id }, { status: 1 });
+    return fresh?.status === 'ACTIVE'
+      ? breakFail(res, 409, 'BREAK_ALREADY_OPEN', 'A break is already in progress')
+      : breakFail(res, 409, 'SESSION_NOT_ACTIVE', 'Session is no longer active');
+  }
+
+  await FocusLog.create({
+    sessionId: updated._id,
+    userId:    req.user._id,
+    event:     FOCUS_EVENT.BREAK_STARTED,
+    timestamp: now,
+    metadata:  { breakType: brk.type, breakIndex: brk.plannedIndex },
+  });
+
+  res.json(Session.toFrontendRecord(updated, resolveTimezone(req.user)));
+}));
+
+// ─── POST /api/sessions/:id/breaks/end ───────────────────────────────────────
+// Body: { endedAt? (ISO) }. Clamped to [break start, min(now, start + length)].
+router.post('/:id/breaks/end', asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id);
+
+  const session = await Session.findOne({ _id: req.params.id, userId: req.user._id });
+  if (!session) return res.status(404).json({ message: 'Session not found' });
+  if (session.status !== 'ACTIVE')
+    return breakFail(res, 409, 'SESSION_NOT_ACTIVE', `Session is already ${session.status}`);
+
+  const open = openBreak(session);
+  if (!open) return breakFail(res, 409, 'NO_OPEN_BREAK', 'No break is in progress');
+
+  const now = new Date();
+  const requested = parseInstant(req.body.endedAt, 'endedAt');
+  const { endedAt, endedEarly } = clampBreakEnd(open, requested && requested < now ? requested : now);
+
+  const updated = await Session.findOneAndUpdate(
+    {
+      _id: session._id, userId: req.user._id, status: 'ACTIVE',
+      breaks: { $elemMatch: { startedAt: open.startedAt, endedAt: null } },
+    },
+    { $set: { 'breaks.$.endedAt': endedAt, 'breaks.$.endedEarly': endedEarly } },
+    { returnDocument: 'after' },
+  );
+  if (!updated) return breakFail(res, 409, 'NO_OPEN_BREAK', 'No break is in progress');
+
+  await FocusLog.create({
+    sessionId: updated._id,
+    userId:    req.user._id,
+    event:     FOCUS_EVENT.BREAK_ENDED,
+    timestamp: endedAt,
+    metadata:  { reason: endedEarly ? 'EARLY' : 'ELAPSED', breakType: open.type, breakIndex: open.plannedIndex },
+  });
+
+  res.json(Session.toFrontendRecord(updated, resolveTimezone(req.user)));
 }));
 
 // ─── GET /api/sessions/:id/logs ──────────────────────────────────────────────
