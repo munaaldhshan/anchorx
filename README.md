@@ -36,7 +36,7 @@ It is currently in beta on iOS through TestFlight, with an App Store release on 
 - **Mobile:** React Native (Expo) and TypeScript, with a custom development build for native features
 - **Backend:** Node.js, Express, and MongoDB (Mongoose)
 - **Auth:** JWT access and refresh tokens, plus Google and Apple sign-in
-- **AI:** GitHub Models as the primary provider, with an automatic Gemini fallback
+- **AI:** one schema-validated `generate()` layer with a configurable provider chain (GitHub Models → Gemini by default) and a rule-based offline fallback (see [docs/step0.md](docs/step0.md))
 - **Email:** Brevo for verification and password-reset codes
 - **Hosting:** Render for the API, MongoDB Atlas for data
 

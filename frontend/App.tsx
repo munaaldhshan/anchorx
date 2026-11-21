@@ -253,9 +253,10 @@ export default function App() {
           await apiFetch(`/sessions/${s.id}/end`, token, {
             method: 'PATCH',
             body: JSON.stringify({
-              status:     'COMPLETED',
-              timerState: { actualDuration: s.plannedDuration ?? s.duration },
-              endedAt:    new Date(startMs + wallMs).toISOString(),
+              status:            'COMPLETED',
+              actualDurationSec: s.plannedDurationSec ?? (s.plannedDuration ?? s.duration) * 60,
+              timerState:        { actualDuration: s.plannedDuration ?? s.duration },  // legacy backends
+              endedAt:           new Date(startMs + wallMs).toISOString(),
             }),
           });
           ended = true;

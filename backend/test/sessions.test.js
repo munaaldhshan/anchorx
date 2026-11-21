@@ -32,7 +32,9 @@ async function createSession(token, overrides = {}) {
       timerMode:   'COUNTDOWN',
       timerConfig: { plannedDuration: 25 },
       dateStr:     today,
-      startedAt:   new Date().toISOString(),
+      // Started well in the past so a claimed focus time isn't clamped by the
+      // server's wall-clock bound (actual ≤ endedAt − startedAt).
+      startedAt:   new Date(Date.now() - 3 * 3600_000).toISOString(),
       ...overrides,
     });
 }

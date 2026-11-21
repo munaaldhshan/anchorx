@@ -29,7 +29,8 @@ async function startSession(token, plannedDuration = 25) {
   return request(app).post('/api/sessions').set(auth(token)).send({
     categoryId: cats.body[0].id, timerMode: 'COUNTDOWN',
     timerConfig: { plannedDuration },
-    dateStr: today, startedAt: new Date().toISOString(),
+    // In the past, so the claimed focus time fits the wall-clock bound.
+    dateStr: today, startedAt: new Date(Date.now() - 3 * 3600_000).toISOString(),
   });
 }
 

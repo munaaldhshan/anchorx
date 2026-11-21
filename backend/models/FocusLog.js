@@ -1,14 +1,7 @@
 import mongoose from 'mongoose';
-const EVENTS = [
-  'SESSION_STARTED',
-  'SESSION_ENDED',
-  'APP_BLOCKED',      
-  'BREAK_STARTED',
-  'BREAK_ENDED',
-  'NFC_VERIFIED',    
-  'NFC_REJECTED',   
-];
+import { FOCUS_EVENTS, DISTRACTION_EVENTS, EVENT_SOURCES } from '../constants/focusEvents.js';
 
+// Event semantics live in constants/focusEvents.js (and docs/step0.md).
 const FocusLogSchema = new mongoose.Schema({
   sessionId: {
     type:     mongoose.Schema.Types.ObjectId,
@@ -24,19 +17,26 @@ const FocusLogSchema = new mongoose.Schema({
   },
   event: {
     type:     String,
-    enum:     EVENTS,
+    enum:     FOCUS_EVENTS,
     required: true,
   },
+  // UTC instant of the event.
   timestamp: { type: Date, default: Date.now },
   metadata: {
-    appName:     { type: String, default: null },
-    packageName: { type: String, default: null },
-    reason:      { type: String, default: null },
+    appName:     { type: String, default: null },  // human-readable app name
+    packageName: { type: String, default: null },  // bundle id, e.g. com.burbn.instagram
+    reason:      { type: String, default: null },  // SESSION_ENDED: COMPLETED | ABANDONED
+    source:      { type: String, enum: [...EVENT_SOURCES, null], default: null },
+    tagUid:      { type: String, default: null },  // NFC_* events
   },
-}, {
 });
 
 FocusLogSchema.index({ sessionId: 1, timestamp: 1 });
 FocusLogSchema.index({ userId: 1, event: 1, timestamp: -1 });
+
+/** Distraction total for a session: APP_BLOCKED + DISTRACTION (see constants). */
+FocusLogSchema.statics.countDistractions = function (sessionId) {
+  return this.countDocuments({ sessionId, event: { $in: DISTRACTION_EVENTS } });
+};
 
 export default mongoose.model('FocusLog', FocusLogSchema);

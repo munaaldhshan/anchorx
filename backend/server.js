@@ -3,6 +3,7 @@ import { createApp } from './app.js';
 import { connectDB, disconnectDB } from './config/db.js';
 import logger from './utils/logger.js';
 import { startNotificationCron } from './jobs/notificationCron.js';
+import { runMigrations } from './migrations/index.js';
 
 // ─── Fail fast on misconfiguration ──────────────────────────────────────────
 // Better to crash on boot than to run with a weak/absent secret or open CORS.
@@ -20,6 +21,10 @@ const app  = createApp();
 const PORT = process.env.PORT || 5000;
 
 connectDB()
+  // Pending migrations are additive + idempotent (see migrations/index.js), so
+  // running them on boot is safe even with several instances starting at once.
+  // Set RUN_MIGRATIONS_ON_BOOT=false to run them manually (npm run migrate).
+  .then(() => (process.env.RUN_MIGRATIONS_ON_BOOT === 'false' ? [] : runMigrations()))
   .then(() => {
     startNotificationCron();
     const server = app.listen(PORT, () => logger.info(`Server running on port ${PORT}`));

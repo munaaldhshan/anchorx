@@ -1,5 +1,7 @@
 import mongoose from 'mongoose';
-import { toUserDate, userTodayStr, shiftDateStr } from '../utils/datetime.js';
+import { localHourOf, userTodayStr, shiftDateStr } from '../utils/datetime.js';
+import { actualSecOf } from './Session.js';
+import { FOCUS_EVENT, eventAppKey } from '../constants/focusEvents.js';
 
 const StatisticsSchema = new mongoose.Schema({
   userId: {
@@ -38,14 +40,15 @@ StatisticsSchema.statics.rebuildForDay = async function (userId, dateStr, tz = '
   const completed   = daySessions.filter(s => s.status === 'COMPLETED');
   const abandoned   = daySessions.filter(s => s.status === 'ABANDONED');
 
-  const totalMins = completed.reduce(
-    (a, s) => a + (s.timerState?.actualDuration || 0), 0,
+  // Sum seconds, round once — avoids per-session rounding drift.
+  const totalMins = Math.round(
+    completed.reduce((a, s) => a + (actualSecOf(s) ?? 0), 0) / 60,
   );
 
   const hourCounts = {};
   for (const s of completed) {
     if (s.startedAt) {
-      const h = toUserDate(s.startedAt, tz).hour;
+      const h = localHourOf(s.startedAt, tz);
       hourCounts[h] = (hourCounts[h] || 0) + 1;
     }
   }
@@ -54,13 +57,15 @@ StatisticsSchema.statics.rebuildForDay = async function (userId, dateStr, tz = '
     : null;
 
   const sessionIds = daySessions.map(s => s._id);
+  // "Top blocked" = enforced blocks only (APP_BLOCKED), not undetected
+  // distractions — see constants/focusEvents.js.
   const blockedLogs = await FocusLog.find({
     sessionId: { $in: sessionIds },
-    event:     'APP_BLOCKED',
+    event:     FOCUS_EVENT.APP_BLOCKED,
   });
   const pkgCounts = {};
   for (const log of blockedLogs) {
-    const pkg = log.metadata?.packageName;
+    const pkg = eventAppKey(log);
     if (pkg) pkgCounts[pkg] = (pkgCounts[pkg] || 0) + 1;
   }
   const topBlockedApp = Object.keys(pkgCounts).length > 0

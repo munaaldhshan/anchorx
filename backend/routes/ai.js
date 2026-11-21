@@ -1,17 +1,17 @@
 import express from 'express';
 import auth from '../middleware/auth.js';
 import AIInsight from '../models/AIInsight.js';
-import { getOrGenerateInsight, MIN_SESSIONS } from '../services/aiInsightsService.js';
+import { getOrGenerateInsight, isInsightFresh, MIN_SESSIONS } from '../services/aiInsightsService.js';
 import { getSuggestion } from '../services/aiSuggestionService.js';
 
 const router = express.Router();
 
 router.use(auth);
 
+// Provider failures never reach here: llm/generate falls back to a rule-based
+// answer (insight.source === 'fallback'). What's left is "not enough data" and
+// genuine bugs.
 function handleAIError(err, req, res) {
-  if (err.code === 'NO_API_KEY') {
-    return res.status(503).json({ message: 'AI service not configured', code: err.code });
-  }
   if (err.code === 'NOT_ENOUGH_DATA') {
     return res.status(400).json({
       message: err.message,
@@ -19,9 +19,6 @@ function handleAIError(err, req, res) {
       sessionCount: err.sessionCount,
       sessionsNeeded: MIN_SESSIONS,
     });
-  }
-  if (err.code === 'BAD_JSON') {
-    return res.status(502).json({ message: 'AI returned malformed response', code: err.code });
   }
   req.log.error({ err }, 'AI route error');
   return res.status(500).json({ message: err.message || 'AI service error' });
@@ -40,20 +37,14 @@ router.post('/insights/generate', async (req, res) => {
 // GET /api/ai/insights - return latest cached or generate
 router.get('/insights', async (req, res) => {
   try {
-    // Try to return existing first without forcing generation
     const existing = await AIInsight.findOne({ userId: req.user._id }).sort({ generatedAt: -1 });
-
-    if (existing) {
-      // Check if it's still fresh (under 6 hours) — if so, return as-is
-      const ageHours = (Date.now() - new Date(existing.generatedAt).getTime()) / 3600000;
-      if (ageHours < 6) {
-        return res.json({ insight: existing, cached: true });
-      }
+    if (isInsightFresh(existing)) {
+      return res.json({ insight: existing, cached: true });
     }
 
     // No existing or stale — try to generate new one
     try {
-      const { insight, cached } = await getOrGenerateInsight(req.user._id);
+      const { insight, cached } = await getOrGenerateInsight(req.user._id, { force: true });
       res.json({ insight, cached });
     } catch (genErr) {
       // If can't generate (not enough data) but we have an old one, return the old one
@@ -80,8 +71,8 @@ router.get('/insights', async (req, res) => {
 // GET /api/ai/suggestion - lightweight Dashboard tip
 router.get('/suggestion', async (req, res) => {
   try {
-    const { suggestion, cached } = await getSuggestion(req.user._id);
-    res.json({ suggestion, cached });
+    const { suggestion, source, cached } = await getSuggestion(req.user._id);
+    res.json({ suggestion, source, cached });
   } catch (err) {
     if (err.code === 'NOT_ENOUGH_DATA') {
       return res.status(204).end();

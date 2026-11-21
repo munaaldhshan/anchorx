@@ -15,9 +15,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       // Report on our own source only (test files + entrypoints excluded).
-      // socialAuth.js / config/gemini.js are intentionally mocked in tests, so
-      // their real verification/SDK paths show low coverage — by design.
-      include: ['routes/**', 'models/**', 'utils/**', 'services/**', 'middleware/**'],
+      // socialAuth.js is intentionally mocked in tests, so its real
+      // verification path shows low coverage — by design.
+      include: ['routes/**', 'models/**', 'utils/**', 'services/**', 'middleware/**', 'llm/**', 'migrations/**', 'constants/**'],
       reporter: ['text', 'html'],
     },
   },

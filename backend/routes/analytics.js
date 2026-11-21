@@ -1,10 +1,12 @@
 import express   from 'express';
-import Session   from '../models/Session.js';
+import Session, { actualSecOf } from '../models/Session.js';
 import Statistics from '../models/Statistics.js';
 import AIInsight  from '../models/AIInsight.js';
 import auth      from '../middleware/auth.js';
 import asyncHandler from '../middleware/asyncHandler.js';
-import { toUserDate, userTodayStr, shiftDateStr, diffDays, weekdayOfDateStr } from '../utils/datetime.js';
+import {
+  localHourOf, userTodayStr, shiftDateStr, diffDays, weekdayOfDateStr, resolveTimezone,
+} from '../utils/datetime.js';
 
 const router     = express.Router();
 
@@ -15,11 +17,14 @@ function daysAgo(n, tz) {
   return shiftDateStr(userTodayStr(tz), -n);
 }
 
+// Focus minutes of a set of sessions: sum seconds, round once.
+const sumMinutes = (list) => Math.round(list.reduce((a, s) => a + (actualSecOf(s) ?? 0), 0) / 60);
+
 // ─── GET /api/analytics/summary?period=day|week|month ─────────────────────────
 // Primary endpoint for AnalyticsScreen filter cards and Dashboard stats.
 // Reads from both the Statistics documents and live Session data.
 router.get('/summary', asyncHandler(async (req, res) => {
-    const tz     = req.user.settings?.timezone || 'UTC';
+    const tz     = resolveTimezone(req.user);
     const period = req.query.period || 'week';
     const days   = period === 'day' ? 1 : period === 'week' ? 7 : 30;
 
@@ -35,9 +40,7 @@ router.get('/summary', asyncHandler(async (req, res) => {
     const completed = sessions.filter(s => s.status === 'COMPLETED');
     const abandoned = sessions.filter(s => s.status === 'ABANDONED');
 
-    const totalMins = completed.reduce(
-      (a, s) => a + (s.timerState?.actualDuration || 0), 0,
-    );
+    const totalMins = sumMinutes(completed);
     const compRate = sessions.length > 0
       ? Math.round((completed.length / sessions.length) * 100) : 0;
     const avgScore = completed.filter(s => s.focusScore !== null).length > 0
@@ -52,7 +55,7 @@ router.get('/summary', asyncHandler(async (req, res) => {
     const hCounts = {};
     for (const s of completed) {
       if (s.startedAt) {
-        const h = toUserDate(s.startedAt, tz).hour;
+        const h = localHourOf(s.startedAt, tz);
         hCounts[h] = (hCounts[h] || 0) + 1;
       }
     }
@@ -81,28 +84,26 @@ router.get('/summary', asyncHandler(async (req, res) => {
       const today  = daysAgo(0, tz);
       barData = labels.map((label, i) => {
         const startH = i * 4;
-        const mins   = completed
+        const mins   = sumMinutes(completed
           .filter(s => s.dateStr === today && s.startedAt)
-          .filter(s => { const h = toUserDate(s.startedAt, tz).hour; return h >= startH && h < startH + 4; })
-          .reduce((a, s) => a + (s.timerState?.actualDuration || 0), 0);
+          .filter(s => { const h = localHourOf(s.startedAt, tz); return h >= startH && h < startH + 4; }));
         return { label, minutes: mins };
       });
     } else if (period === 'week') {
       barData = Array.from({ length: 7 }, (_, i) => {
         const ds  = daysAgo(6 - i, tz);
         const dow = weekdayOfDateStr(ds);
-        const mins = completed.filter(s => s.dateStr === ds)
-          .reduce((a, s) => a + (s.timerState?.actualDuration || 0), 0);
+        const mins = sumMinutes(completed.filter(s => s.dateStr === ds));
         return { label: DAY[dow], minutes: mins };
       });
     } else {
       const today = daysAgo(0, tz);
       barData = Array.from({ length: 4 }, (_, i) => {
         const hi = (3 - i) * 7, lo = hi + 7;
-        const mins = completed.filter(s => {
+        const mins = sumMinutes(completed.filter(s => {
           const dAgo = diffDays(s.dateStr, today);
           return dAgo >= hi && dAgo < lo;
-        }).reduce((a, s) => a + (s.timerState?.actualDuration || 0), 0);
+        }));
         return { label: `W${i + 1}`, minutes: mins };
       });
     }
@@ -132,7 +133,7 @@ router.get('/summary', asyncHandler(async (req, res) => {
 // ─── GET /api/analytics/statistics?from=YYYY-MM-DD&to=YYYY-MM-DD ─────────────
 // Raw daily statistics documents — consumed by ML service for training data.
 router.get('/statistics', asyncHandler(async (req, res) => {
-  const tz   = req.user.settings?.timezone || 'UTC';
+  const tz   = resolveTimezone(req.user);
   const from = req.query.from || daysAgo(30, tz);
   const to   = req.query.to   || daysAgo(0, tz);
 

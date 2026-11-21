@@ -72,3 +72,79 @@ export function diffDays(fromStr, toStr) {
 export function weekdayOfDateStr(dateStr) {
   return new Date(`${dateStr}T12:00:00Z`).getUTCDay();
 }
+
+// ─── Day bucketing (the single place "which local day?" is decided) ─────────
+// Storage rule: every instant is a UTC Date. A *day* is always a user-local
+// calendar date (YYYY-MM-DD) derived from an instant + an IANA zone, here.
+// Never use Date#getHours / getDay / setHours on the server: they read the
+// server's own zone (UTC on Render), not the user's.
+
+/**
+ * The timezone to bucket by. Accepts an IANA string or a user doc
+ * ({ settings: { timezone } }); anything unusable resolves to 'UTC'.
+ */
+export function resolveTimezone(tzOrUser) {
+  const tz = typeof tzOrUser === 'string' ? tzOrUser : tzOrUser?.settings?.timezone;
+  return isValidTimezone(tz) ? tz : 'UTC';
+}
+
+/** Local calendar day (YYYY-MM-DD) an instant falls on in `tz`. */
+export function localDayOf(date, tz = 'UTC') {
+  return toUserDate(date, tz).dateStr;
+}
+
+/** Local hour-of-day (0-23) of an instant in `tz`. */
+export function localHourOf(date, tz = 'UTC') {
+  return toUserDate(date, tz).hour;
+}
+
+/** Local weekday (0=Sun..6=Sat) of an instant in `tz`. */
+export function localWeekdayOf(date, tz = 'UTC') {
+  return toUserDate(date, tz).weekday;
+}
+
+/** Local "HH:MM" of an instant in `tz` (display layer). */
+export function formatLocalHHMM(date, tz = 'UTC') {
+  const p = toUserDate(date, tz);
+  return `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}`;
+}
+
+// Offset (ms) of `tz` from UTC at `instantMs`: local wall clock read as if it
+// were UTC, minus the instant itself. +3h for Istanbul, −4h for New York (EDT).
+function tzOffsetMs(instantMs, tz) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(new Date(instantMs));
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value);
+  const hour = get('hour') === 24 ? 0 : get('hour');
+  const wallAsUtc = Date.UTC(get('year'), get('month') - 1, get('day'), hour, get('minute'), get('second'));
+  return wallAsUtc - Math.floor(instantMs / 1000) * 1000;
+}
+
+/**
+ * UTC instant at which local day `dateStr` begins in `tz` (DST-aware). For the
+ * rare zones whose clocks skip midnight, returns the first instant that is on
+ * `dateStr`.
+ */
+export function localDayStartUtc(dateStr, tz = 'UTC') {
+  const zone = resolveTimezone(tz);
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const wallMidnight = Date.UTC(y, m - 1, d);
+  // Two passes: the offset at the first guess may differ from the offset at
+  // the true instant when a DST transition sits between them.
+  let t = wallMidnight - tzOffsetMs(wallMidnight, zone);
+  t = wallMidnight - tzOffsetMs(t, zone);
+  // Midnight fell in a DST gap → we landed on the previous day; step forward.
+  while (localDayOf(new Date(t), zone) < dateStr) t += 3_600_000;
+  return new Date(t);
+}
+
+/** [start, end) UTC instants covering local day `dateStr` in `tz`. */
+export function localDayRangeUtc(dateStr, tz = 'UTC') {
+  return {
+    start: localDayStartUtc(dateStr, tz),
+    end:   localDayStartUtc(shiftDateStr(dateStr, 1), tz),
+  };
+}

@@ -3,14 +3,14 @@ import User from '../models/User.js';
 import Session from '../models/Session.js';
 import Statistics from '../models/Statistics.js';
 import { sendPush } from '../utils/push.js';
-import { toUserDate, userTodayStr } from '../utils/datetime.js';
+import { localHourOf, userTodayStr, resolveTimezone } from '../utils/datetime.js';
 import logger from '../utils/logger.js';
 
 // ─── Per-user processing ──────────────────────────────────────────────────────
 
 export async function processUser(user, now) {
-  const tz           = user.settings?.timezone  || 'UTC';
-  const { hour }     = toUserDate(now, tz);
+  const tz           = resolveTimezone(user);
+  const hour         = localHourOf(now, tz);
   const today        = userTodayStr(tz);
   const reminderHour = user.settings?.reminderHour ?? 20;
   const nudgeHour    = user.settings?.nudgeHour    ?? 9;
