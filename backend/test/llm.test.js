@@ -566,3 +566,35 @@ describe('getLLMStatus', () => {
     expect(status.lastPrimarySuccessAt).toBeInstanceOf(Date);
   });
 });
+
+// ─── generate({ check }) — per-call validation hook (used by the coach) ─────
+describe('generate check hook', () => {
+  it('treats a check failure like a validation error: one corrective retry with the message fed back', async () => {
+    process.env.LLM_API_KEY = 'pat';
+    routeFetch({ oa: [openaiOk({ hour: 3, label: 'low' }), openaiOk(VALID)] });
+    const check = (d) => (d.hour === 3 ? 'hour 3 is not allowed' : null);
+
+    const { data, meta } = await generate(MSGS, FAST_TASK, { check });
+    expect(data).toEqual(VALID);
+    expect(meta.source).toBe('llm');
+    const retryBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(retryBody.messages.at(-1).content).toContain('hour 3 is not allowed');
+  });
+
+  it('never returns data that failed the check: falls through the chain to the fallback', async () => {
+    process.env.LLM_API_KEY = 'pat';
+    routeFetch({ oa: [openaiOk({ hour: 3, label: 'low' })] });
+    const { data, meta } = await generate(MSGS, FAST_TASK, { check: () => 'always wrong', context: { hour: 7 } });
+    expect(meta.source).toBe('fallback');
+    expect(meta.reason).toBe('invalid_output:openai');
+    expect(data).toEqual({ hour: 7, label: 'low' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);     // bounded: original + one corrective retry
+  });
+
+  it('a throwing check counts as a failure, not a crash', async () => {
+    process.env.LLM_API_KEY = 'pat';
+    routeFetch({ oa: [openaiOk(VALID)] });
+    const { meta } = await generate(MSGS, FAST_TASK, { check: () => { throw new Error('boom'); } });
+    expect(meta.source).toBe('fallback');
+  });
+});

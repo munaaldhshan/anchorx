@@ -3,10 +3,14 @@ import auth from '../middleware/auth.js';
 import AIInsight from '../models/AIInsight.js';
 import { getOrGenerateInsight, isInsightFresh, MIN_SESSIONS } from '../services/aiInsightsService.js';
 import { getSuggestion } from '../services/aiSuggestionService.js';
+import coachRoutes from './coach.js';
 
 const router = express.Router();
 
 router.use(auth);
+
+// AI Focus Coach conversations (auth applied above).
+router.use('/coach', coachRoutes);
 
 // Provider failures never reach here: llm/generate falls back to a rule-based
 // answer (insight.source === 'fallback'). What's left is "not enough data" and
