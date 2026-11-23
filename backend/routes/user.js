@@ -8,6 +8,7 @@ import FocusLog from '../models/FocusLog.js';
 import Statistics from '../models/Statistics.js';
 import AIInsight from '../models/AIInsight.js';
 import AIUsage from '../models/AIUsage.js';
+import CoachConversation from '../models/CoachConversation.js';
 import RefreshToken from '../models/RefreshToken.js';
 import auth from '../middleware/auth.js';
 import asyncHandler from '../middleware/asyncHandler.js';
@@ -119,6 +120,7 @@ router.delete('/me', asyncHandler(async (req, res) => {
     UserTag.deleteMany({ userId }),
     AIInsight.deleteMany({ userId }),
     AIUsage.deleteMany({ userId }),
+    CoachConversation.deleteMany({ userId }),
     RefreshToken.deleteMany({ userId }),
   ]);
   await User.findByIdAndDelete(userId);

@@ -111,7 +111,7 @@ Each task declares a tier in `defineTask({ tier })`. With `LLM_PROVIDER` and `LL
 | Tier | Used by | Chain |
 |---|---|---|
 | `strong` (default) | Insights | `gemini:GEMINI_MODEL` (3.8 Flash) → `gemini:GEMINI_MODEL_FAST` (3.5 Flash-Lite) → `openai:LLM_MODEL` (GitHub gpt-4.1-mini) → rule-based |
-| `fast` | Tips; coach and planner (planned) | `gemini:GEMINI_MODEL_FAST` → `openai:LLM_MODEL` → rule-based |
+| `fast` | Tips; AI Focus Coach (`coach_step`, see [ai-focus-coach.md](ai-focus-coach.md)); planner (planned) | `gemini:GEMINI_MODEL_FAST` → `openai:LLM_MODEL` → rule-based |
 
 So an overloaded 3.8 Flash (503 "high demand") drops to 3.5 Flash-Lite before leaving Gemini. A 429 cool-down (`Retry-After` / `retryDelay`) pauses only the model that hit it, because Gemini quotas are per model. Requests/min and tokens/min limits stay per provider.
 

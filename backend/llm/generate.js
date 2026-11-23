@@ -5,6 +5,11 @@
 //   messages  [{ role: 'system'|'user'|'assistant', content: string }]
 //   task      a defineTask() result: { name, schema (zod), fallback, safeDefault }
 //   context   plain data handed to the task's rule-based fallback
+//   check     optional (data) => string|null run after zod succeeds. A string
+//             is treated exactly like a validation error (corrective retry,
+//             then next link, then rule-based fallback). Use it for per-call
+//             rules a static schema can't express (e.g. "every number must
+//             appear in the tool results").
 //
 // Flow: for each { provider, model } in the configured chain → local rate
 // limit slot → request with timeout → transient-error retries (backoff +
@@ -78,11 +83,17 @@ function parseJSON(text) {
   return undefined;
 }
 
-function validate(task, text) {
+function validate(task, text, check) {
   const raw = parseJSON(text);
   if (raw === undefined) return { ok: false, error: 'Response was not valid JSON.' };
   const r = task.schema.safeParse(raw);
-  return r.success ? { ok: true, data: r.data } : { ok: false, error: z.prettifyError(r.error) };
+  if (!r.success) return { ok: false, error: z.prettifyError(r.error) };
+  if (check) {
+    let problem;
+    try { problem = check(r.data); } catch { problem = 'Response failed a server-side check.'; }
+    if (problem) return { ok: false, error: String(problem) };
+  }
+  return { ok: true, data: r.data };
 }
 
 const estimateTokens = (messages, maxTokens) =>
@@ -155,7 +166,7 @@ function runFallback(task, context, log) {
 
 // `userId` (optional) counts the call against that user's AI_DAILY_LIMIT; over
 // the limit the call goes straight to the rule-based fallback.
-export async function generate(messages, task, { context, log = logger, userId } = {}) {
+export async function generate(messages, task, { context, log = logger, userId, check } = {}) {
   if (!Array.isArray(messages) || !messages.every(m => typeof m?.content === 'string' && m.role))
     throw new TypeError('generate(messages, task): messages must be [{ role, content }]');
   if (!task?.schema || !registry.has(task.name))
@@ -181,7 +192,7 @@ export async function generate(messages, task, { context, log = logger, userId }
     try {
       for (let fix = 0; fix < 2; fix++) {
         const out = await callProvider({ provider, model: link.model, messages: convo, task, cfg, log, counter });
-        const v = validate(task, out.text);
+        const v = validate(task, out.text, check);
         if (v.ok) {
           const meta = {
             source: 'llm', provider: provider.id, model: link.model, task: task.name,
